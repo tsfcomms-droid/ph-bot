@@ -18,12 +18,13 @@ const KEYBOARD = {
     [{ text: '🏪 Vendor Portal', web_app: { url: 'https://premiumhoodies.io/mini-app' } }],
     [
       { text: '🔒 Escrow', url: 'https://t.me/+a-9vZgKXXIg5M2U0' },
-      { text: '💰 Get Paid', url: 'https://t.me/+78SyhmdNqvFmYmM0' }
+      { text: '💰 Get Paid', url: 'https://t.me/+iunLehpOl4U3NmE0' }
     ],
     [
       { text: '📋 Get Listed', url: 'https://t.me/tim_identity' },
       { text: '📩 Contact Us', url: 'https://t.me/tim_identity' }
     ],
+    [{ text: '🤖 Get Your Own Bot', url: 'https://t.me/+AFuV4h1EB19jZWM8' }],
     [{ text: '🌐 Website', url: 'https://premiumhoodies.io' }]
   ]
 };
