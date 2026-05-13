@@ -26,7 +26,7 @@ async function trackUser(user) {
   const body = JSON.stringify(data);
   const req = https.request({
     hostname: 'firestore.googleapis.com',
-    path: `/v1/projects/premium-hoodies/databases/(default)/documents/bot_users/${uid}?updateMask.fieldPaths=uid&updateMask.fieldPaths=first_name&updateMask.fieldPaths=username&updateMask.fieldPaths=last_active`,
+    path: `/v1/projects/premium-hoodies/databases/(default)/documents/bot_users/${uid}?updateMask.fieldPaths=uid&updateMask.fieldPaths=first_name&updateMask.fieldPaths=username&updateMask.fieldPaths=last_active&key=AIzaSyBPHV_-_y8cmITx_Ye3psmODNXt3z9p1yc`,
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
   }, res => { res.resume(); });
@@ -46,7 +46,7 @@ async function trackUser(user) {
   });
   const req2 = https.request({
     hostname: 'firestore.googleapis.com',
-    path: '/v1/projects/premium-hoodies/databases/(default)/documents:commit',
+    path: '/v1/projects/premium-hoodies/databases/(default)/documents:commit?key=AIzaSyBPHV_-_y8cmITx_Ye3psmODNXt3z9p1yc',
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(counterBody) }
   }, res => { res.resume(); });
