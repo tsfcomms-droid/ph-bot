@@ -2,6 +2,61 @@ const https = require('https');
 
 const TOKEN = '8723109846:AAGgik2d-BW3pkFnIxArFG6rIYnN_XNWSYY';
 
+// Firebase config
+const FIREBASE_URL = 'premium-hoodies-default-rtdb.firebaseio.com';
+const FIRESTORE_URL = 'firestore.googleapis.com/v1/projects/premium-hoodies/databases/(default)/documents';
+
+// Track user in Firestore
+async function trackUser(user) {
+  const uid = String(user.id);
+  const now = new Date().toISOString();
+  const today = now.split('T')[0];
+
+  const data = {
+    fields: {
+      uid: { stringValue: uid },
+      first_name: { stringValue: user.first_name || '' },
+      username: { stringValue: user.username || '' },
+      last_active: { stringValue: now },
+      first_seen: { stringValue: now }
+    }
+  };
+
+  // Upsert user doc
+  const body = JSON.stringify(data);
+  const req = https.request({
+    hostname: 'firestore.googleapis.com',
+    path: `/v1/projects/premium-hoodies/databases/(default)/documents/bot_users/${uid}?updateMask.fieldPaths=uid&updateMask.fieldPaths=first_name&updateMask.fieldPaths=username&updateMask.fieldPaths=last_active`,
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+  }, res => { res.resume(); });
+  req.on('error', () => {});
+  req.write(body);
+  req.end();
+
+  // Increment daily counter
+  const counterBody = JSON.stringify({
+    transaction: null,
+    writes: [{
+      transform: {
+        document: `projects/premium-hoodies/databases/(default)/documents/bot_stats/daily_${today}`,
+        fieldTransforms: [{ fieldPath: 'count', increment: { integerValue: 1 } }]
+      }
+    }]
+  });
+  const req2 = https.request({
+    hostname: 'firestore.googleapis.com',
+    path: '/v1/projects/premium-hoodies/databases/(default)/documents:commit',
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(counterBody) }
+  }, res => { res.resume(); });
+  req2.on('error', () => {});
+  req2.write(counterBody);
+  req2.end();
+
+  console.log(`📊 User tracked: ${user.first_name || uid} (@${user.username || 'no_username'})`);
+}
+
 const WELCOME = `🧥 *Welcome to Premium Hoodies*
 
 The most trusted vendor directory on Telegram.
@@ -112,6 +167,7 @@ async function poll() {
         const name = msg.from?.first_name || 'there';
         console.log(`Message from ${name}: ${text}`);
         if (text.startsWith('/start') || text.startsWith('/menu')) {
+          trackUser(msg.from);
           await sendWithPhoto(chatId, WELCOME);
         } else {
           await sendWithPhoto(chatId, `Hey ${name}! Use the menu below 👇`);
