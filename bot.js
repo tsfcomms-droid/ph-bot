@@ -2,7 +2,7 @@ const https = require('https');
 const fs    = require('fs');
 
 const TOKEN    = '8723109846:AAGgik2d-BW3pkFnIxArFG6rIYnN_XNWSYY';
-const ADMIN_ID = 6492492818;
+const ADMIN_ID = 7031425680;
 
 const USERS_FILE      = './users.json';
 const BROADCASTS_FILE = './broadcasts.json';
