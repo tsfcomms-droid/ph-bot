@@ -4,5 +4,8 @@
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
