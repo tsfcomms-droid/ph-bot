@@ -558,15 +558,19 @@ async function handleMessage(msg) {
 
 async function poll() {
   try {
-    const res = await api('getUpdates', { offset, timeout: 30, limit: 100 });
+    const res = await api('getUpdates', { offset, timeout: 30, limit: 100, allowed_updates: ['message', 'callback_query'] });
     if (res.ok && res.result.length) {
       for (const update of res.result) {
         offset = update.update_id + 1;
         try {
-          if (update.callback_query) await handleCallback(update.callback_query);
-          else if (update.message)   await handleMessage(update.message);
+          if (update.callback_query) {
+            console.log('🔘 Button pressed:', update.callback_query.data, '| from:', update.callback_query.from?.id);
+            await handleCallback(update.callback_query);
+          } else if (update.message) {
+            await handleMessage(update.message);
+          }
         } catch(e) {
-          console.error('❌ Update error:', e.message);
+          console.error('❌ Update error:', e.message, e.stack);
         }
       }
     }
@@ -579,6 +583,8 @@ async function poll() {
 // ── Start ─────────────────────────────────────────────────────────────────────
 
 async function start() {
+  await api('deleteWebhook', { drop_pending_updates: true });
+  console.log('✅ Webhook cleared');
   const me = await api('getMe', {});
   console.log(`✅ Bot started: @${me.result.username}`);
 
