@@ -293,12 +293,13 @@ async function deleteLastBroadcast() {
 // ── Callback query handler ────────────────────────────────────────────────────
 
 async function handleCallback(cb) {
-  const chatId = cb.from.id;
-  const msgId  = cb.message.message_id;
-  const data   = cb.data;
-
   await api('answerCallbackQuery', { callback_query_id: cb.id });
 
+  const chatId = cb.from?.id;
+  const msgId  = cb.message?.message_id;
+  const data   = cb.data;
+
+  if (!chatId || !msgId) return;
   if (!isAdmin(chatId)) return;
 
   // Navigation
