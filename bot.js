@@ -89,7 +89,13 @@ function api(method, data) {
     }, res => {
       let d = '';
       res.on('data', c => d += c);
-      res.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { reject(e); } });
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(d);
+          if (!parsed.ok) console.error(`❌ API [${method}]:`, parsed.description);
+          resolve(parsed);
+        } catch(e) { reject(e); }
+      });
     });
     req.on('error', reject);
     req.write(body);
@@ -555,8 +561,12 @@ async function poll() {
     if (res.ok && res.result.length) {
       for (const update of res.result) {
         offset = update.update_id + 1;
-        if (update.callback_query) await handleCallback(update.callback_query);
-        else if (update.message)   await handleMessage(update.message);
+        try {
+          if (update.callback_query) await handleCallback(update.callback_query);
+          else if (update.message)   await handleMessage(update.message);
+        } catch(e) {
+          console.error('❌ Update error:', e.message);
+        }
       }
     }
   } catch(e) {
