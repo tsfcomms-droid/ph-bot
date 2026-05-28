@@ -147,10 +147,56 @@ function trackUser(chatId, name, username) {
     users.push({ chatId, name: name || 'Unknown', username: username || '', joinedAt: Date.now() });
     saveJSON(USERS_FILE, users);
     logReport('newUser');
+    // Persist to Firestore (non-blocking)
+    fsPatch('bot_users', String(chatId), {
+      chatId, name: name || 'Unknown', username: username || '', joinedAt: Date.now()
+    }).catch(() => {});
   } else {
     existing.name     = name     || existing.name;
     existing.username = username || existing.username;
     saveJSON(USERS_FILE, users);
+    // Keep Firestore in sync
+    fsPatch('bot_users', String(chatId), {
+      name: existing.name, username: existing.username
+    }).catch(() => {});
+  }
+}
+
+async function recoverUsersFromFirestore() {
+  try {
+    console.log('🔄 users.json missing — recovering from Firestore...');
+    let pageToken = '';
+    const recovered = [];
+    do {
+      const url = `${FS_PATH}/bot_users?pageSize=300${pageToken ? '&pageToken=' + encodeURIComponent(pageToken) : ''}&key=${FB_KEY}`;
+      const res = await new Promise((resolve, reject) => {
+        const req = https.request({ hostname: FS_BASE, path: url, method: 'GET' }, r => {
+          let d = ''; r.on('data', c => d += c); r.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { reject(e); } });
+        });
+        req.on('error', reject); req.end();
+      });
+      if (res.documents) {
+        for (const doc of res.documents) {
+          const f = doc.fields || {};
+          recovered.push({
+            chatId:   parseInt(f.chatId?.integerValue   || 0),
+            name:     f.name?.stringValue                || 'Unknown',
+            username: f.username?.stringValue            || '',
+            joinedAt: parseInt(f.joinedAt?.integerValue || 0)
+          });
+        }
+      }
+      pageToken = res.nextPageToken || '';
+    } while (pageToken);
+
+    if (recovered.length) {
+      saveJSON(USERS_FILE, recovered);
+      console.log(`✅ Recovered ${recovered.length} users from Firestore`);
+    } else {
+      console.log('ℹ️ No users found in Firestore yet');
+    }
+  } catch(e) {
+    console.error('⚠️ Could not recover users from Firestore:', e.message);
   }
 }
 
@@ -675,7 +721,7 @@ async function sendReferralLink(chatId, handle) {
     const res = await api('createChatInviteLink', {
       chat_id: CHANNEL_ID,
       name:    handle,
-      creates_join_request: false
+      creates_join_request: true
     });
 
     if (!res.ok) {
@@ -754,6 +800,10 @@ async function poll() {
 // ── Start ─────────────────────────────────────────────────────────────────────
 
 async function start() {
+  // Recover users from Firestore if local file is missing or empty
+  const localUsers = loadJSON(USERS_FILE, []);
+  if (!localUsers.length) await recoverUsersFromFirestore();
+
   await api('deleteWebhook', { drop_pending_updates: true });
   console.log('✅ Webhook cleared');
   const me = await api('getMe', {});
