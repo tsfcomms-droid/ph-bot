@@ -1,8 +1,96 @@
 const https = require('https');
 const fs    = require('fs');
 
-const TOKEN    = '8723109846:AAGgik2d-BW3pkFnIxArFG6rIYnN_XNWSYY';
-const ADMIN_ID = 7031425680;
+const TOKEN      = '8723109846:AAGgik2d-BW3pkFnIxArFG6rIYnN_XNWSYY';
+const ADMIN_ID   = 7031425680;
+const CHANNEL_ID = -1002289726091;
+
+// ── Firestore REST (for referral tracking) ────────────────────────────────────
+const FB_KEY  = 'AIzaSyBPHV_-_y8cmITx_Ye3psmODNXt3z9p1yc';
+const FS_BASE = 'firestore.googleapis.com';
+const FS_PATH = '/v1/projects/premium-hoodies/databases/(default)/documents';
+
+function fsRequest(method, path, body) {
+  return new Promise((resolve, reject) => {
+    const data = body ? JSON.stringify(body) : null;
+    const req  = https.request({
+      hostname: FS_BASE,
+      path:     `${FS_PATH}/${path}?key=${FB_KEY}`,
+      method,
+      headers:  { 'Content-Type': 'application/json', ...(data ? { 'Content-Length': Buffer.byteLength(data) } : {}) }
+    }, res => {
+      let d = '';
+      res.on('data', c => d += c);
+      res.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { reject(e); } });
+    });
+    req.on('error', reject);
+    if (data) req.write(data);
+    req.end();
+  });
+}
+
+function fsVal(v) {
+  if (typeof v === 'number') return { integerValue: String(v) };
+  if (typeof v === 'string') return { stringValue: v };
+  return { stringValue: String(v) };
+}
+
+async function fsGet(col, doc) {
+  return fsRequest('GET', `${col}/${doc}`, null);
+}
+
+async function fsPatch(col, doc, fields) {
+  const firestoreFields = {};
+  for (const [k, v] of Object.entries(fields)) firestoreFields[k] = fsVal(v);
+  const updateMask = Object.keys(fields).map(k => `updateMask.fieldPaths=${k}`).join('&');
+  return new Promise((resolve, reject) => {
+    const data = JSON.stringify({ fields: firestoreFields });
+    const req  = https.request({
+      hostname: FS_BASE,
+      path:     `${FS_PATH}/${col}/${doc}?${updateMask}&key=${FB_KEY}`,
+      method:   'PATCH',
+      headers:  { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) }
+    }, res => {
+      let d = '';
+      res.on('data', c => d += c);
+      res.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { reject(e); } });
+    });
+    req.on('error', reject);
+    req.write(data);
+    req.end();
+  });
+}
+
+async function recordReferral(handle, newChatId, name, username) {
+  try {
+    // Check if this user was already referred
+    const joinDoc = await fsGet('referral_joins', String(newChatId));
+    if (joinDoc.fields) return null; // already counted
+
+    // Get referrer info
+    const refDoc = await fsGet('referrers', handle);
+    if (!refDoc.fields) return null; // handle doesn't exist
+
+    const referrerChatId = parseInt(refDoc.fields.chatId?.integerValue || 0);
+    const currentRefs    = parseInt(refDoc.fields.totalRefs?.integerValue || 0);
+
+    // Record the join
+    await fsPatch('referral_joins', String(newChatId), {
+      referrerHandle: handle,
+      newUserChatId:  newChatId,
+      newUserName:    name || '',
+      joinedAt:       String(Date.now())
+    });
+
+    // Increment referrer count
+    await fsPatch('referrers', handle, { totalRefs: currentRefs + 1 });
+
+    return referrerChatId;
+  } catch(e) {
+    console.error('Referral error:', e.message);
+    return null;
+  }
+}
 
 const USERS_FILE      = './users.json';
 const BROADCASTS_FILE = './broadcasts.json';
@@ -540,8 +628,15 @@ async function handleMessage(msg) {
     return showAdminMenu(chatId);
   }
 
+  // /start getlink_HANDLE — generate unique channel invite link for referrer
+  if (text.startsWith('/start getlink_')) {
+    const handle = text.slice('/start getlink_'.length).trim();
+    await sendReferralLink(chatId, handle);
+    return;
+  }
+
   // /start or /menu
-  if (text === '/start' || text === '/menu') {
+  if (text === '/start' || text.startsWith('/start') || text === '/menu') {
     if (!cfg.shopOpen) {
       return api('sendMessage', { chat_id: chatId, text: cfg.closedMessage, parse_mode: 'Markdown' });
     }
@@ -554,11 +649,85 @@ async function handleMessage(msg) {
   }
 }
 
+// ── Referral link generation ──────────────────────────────────────────────────
+
+async function sendReferralLink(chatId, handle) {
+  try {
+    const refDoc = await fsGet('referrers', handle);
+    if (!refDoc.fields) {
+      return api('sendMessage', { chat_id: chatId, text: '❌ Handle not found. Claim it first in the Earn tab.' });
+    }
+    const storedChatId = parseInt(refDoc.fields.chatId?.integerValue || 0);
+    if (storedChatId !== chatId) {
+      return api('sendMessage', { chat_id: chatId, text: '❌ That handle belongs to someone else.' });
+    }
+
+    // Already generated — just resend it
+    if (refDoc.fields.inviteLink?.stringValue) {
+      return api('sendMessage', {
+        chat_id: chatId,
+        text: `🔗 *Your referral link:*\n\n${refDoc.fields.inviteLink.stringValue}\n\nShare this link\\. Every person who joins the channel counts as 1 referral\\.`,
+        parse_mode: 'MarkdownV2'
+      });
+    }
+
+    // Create a unique invite link named after the handle so we can identify it on join
+    const res = await api('createChatInviteLink', {
+      chat_id: CHANNEL_ID,
+      name:    handle,
+      creates_join_request: false
+    });
+
+    if (!res.ok) {
+      console.error('createChatInviteLink failed:', res);
+      return api('sendMessage', { chat_id: chatId, text: '❌ Could not generate link. Make sure the bot is admin in the channel.' });
+    }
+
+    const inviteLink = res.result.invite_link;
+    await fsPatch('referrers', handle, { inviteLink });
+
+    return api('sendMessage', {
+      chat_id: chatId,
+      text: `🔗 *Your referral link:*\n\n${inviteLink}\n\nShare this link\\. Every person who joins the channel counts as 1 referral\\.`,
+      parse_mode: 'MarkdownV2'
+    });
+  } catch(e) {
+    console.error('sendReferralLink error:', e.message);
+    return api('sendMessage', { chat_id: chatId, text: '❌ Error generating link. Try again.' });
+  }
+}
+
+// ── Channel join tracking ─────────────────────────────────────────────────────
+
+async function handleChatMember(cm) {
+  if (cm.chat?.id !== CHANNEL_ID) return;
+  if (cm.new_chat_member?.status !== 'member') return;
+
+  const inviteLink = cm.invite_link;
+  if (!inviteLink) return;
+
+  const handle = inviteLink.name; // we set name = handle when creating
+  if (!handle) return;
+
+  const newUser   = cm.new_chat_member.user;
+  const newId     = newUser?.id;
+  const newName   = newUser?.first_name || 'Someone';
+  const newUname  = newUser?.username   || '';
+
+  const referrerChatId = await recordReferral(handle, newId, newName, newUname);
+  if (referrerChatId && referrerChatId !== newId) {
+    await api('sendMessage', {
+      chat_id: referrerChatId,
+      text: `🎉 Someone joined the channel via your link!\n\n👤 ${newName}${newUname ? ' (@' + newUname + ')' : ''}\n\nCheck your stats in the Earn tab.`
+    });
+  }
+}
+
 // ── Poll ──────────────────────────────────────────────────────────────────────
 
 async function poll() {
   try {
-    const res = await api('getUpdates', { offset, timeout: 30, limit: 100, allowed_updates: ['message', 'callback_query'] });
+    const res = await api('getUpdates', { offset, timeout: 30, limit: 100, allowed_updates: ['message', 'callback_query', 'chat_member'] });
     if (res.ok && res.result.length) {
       for (const update of res.result) {
         offset = update.update_id + 1;
@@ -566,6 +735,8 @@ async function poll() {
           if (update.callback_query) {
             console.log('🔘 Button pressed:', update.callback_query.data, '| from:', update.callback_query.from?.id);
             await handleCallback(update.callback_query);
+          } else if (update.chat_member) {
+            await handleChatMember(update.chat_member);
           } else if (update.message) {
             await handleMessage(update.message);
           }
