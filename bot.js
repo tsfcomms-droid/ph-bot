@@ -769,6 +769,62 @@ async function handleChatMember(cm) {
   }
 }
 
+// ── Post Queue ────────────────────────────────────────────────────────────────
+
+let lastQueueCheck = 0;
+
+async function processPostQueue() {
+  const now = Date.now();
+  if (now - lastQueueCheck < 15000) return; // check every 15s
+  lastQueueCheck = now;
+  try {
+    const url = `${FS_PATH}/post_queue?key=${FB_KEY}`;
+    const res = await fsGet(url);
+    if (!res.documents) return;
+    for (const doc of res.documents) {
+      const f = doc.fields || {};
+      if (f.status?.stringValue !== 'pending') continue;
+      const docId = doc.name.split('/').pop();
+      // vendorData stored as a Firestore map — extract fields
+      const vf = f.vendorData?.mapValue?.fields || {};
+      const readStr = x => x?.stringValue || '';
+      const readArr = x => (x?.arrayValue?.values || []).map(v => {
+        const mf = v.mapValue?.fields || {};
+        return { type: readStr(mf.type), label: readStr(mf.label), val: readStr(mf.val) };
+      });
+      const d = { name: readStr(vf.name), loc: readStr(vf.loc), svc: readStr(vf.svc), lang: readStr(vf.lang), logoURL: readStr(vf.logoURL), contact: readArr(vf.contact) };
+
+      const typeIcons = { telegram:'📱', signal:'🔒', simplex:'💬', threema:'🛡', xmpp:'⚙️', link:'🔗', email:'📧' };
+      const contacts = (d.contact || []).map(c => `${typeIcons[c.type]||'•'} ${c.label}: ${c.val}`).join('\n');
+      const text = `🏪 *${d.name}*\n📍 ${d.loc}\n🛍 ${d.svc}${d.lang ? ' · ' + d.lang : ''}\n\n${contacts ? '📬 *Contacts:*\n' + contacts + '\n\n' : ''}🔎 Find more vendors @premiumhoodiesbot`;
+
+      try {
+        if (d.logoURL) {
+          await api('sendPhoto', { chat_id: CHANNEL_ID, photo: d.logoURL, caption: text, parse_mode: 'Markdown' });
+        } else {
+          await api('sendMessage', { chat_id: CHANNEL_ID, text, parse_mode: 'Markdown' });
+        }
+        console.log(`📣 Posted vendor card: ${d.name}`);
+      } catch(e) {
+        console.error('Post to channel failed:', e.message);
+      }
+
+      // Mark as sent
+      await fsPatch('post_queue', docId, { status: 'sent' });
+    }
+  } catch(e) {}
+}
+
+async function fsGet(url) {
+  return new Promise((resolve, reject) => {
+    const opts = { hostname: FS_BASE, path: url.replace('https://' + FS_BASE, ''), method: 'GET' };
+    const req = https.request(opts, r => {
+      let d = ''; r.on('data', c => d += c); r.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { reject(e); } });
+    });
+    req.on('error', reject); req.end();
+  });
+}
+
 // ── Poll ──────────────────────────────────────────────────────────────────────
 
 async function poll() {
@@ -794,6 +850,7 @@ async function poll() {
   } catch(e) {
     console.error('Poll error:', e.message);
   }
+  processPostQueue();
   setTimeout(poll, 1000);
 }
 
