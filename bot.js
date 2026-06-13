@@ -795,13 +795,14 @@ async function processPostQueue() {
       const d = { name: readStr(vf.name), loc: readStr(vf.loc), svc: readStr(vf.svc), lang: readStr(vf.lang), logoURL: readStr(vf.logoURL), contact: readArr(vf.contact) };
 
       const typeIcons = { telegram:'📱', signal:'🔒', simplex:'💬', threema:'🛡', xmpp:'⚙️', link:'🔗', email:'📧' };
-      const contacts = (d.contact || []).map(c => `${typeIcons[c.type]||'•'} ${c.label}: ${c.val}`).join('\n');
-      const text = `🏪 *${d.name}*\n📍 ${d.loc}\n🛍 ${d.svc}${d.lang ? ' · ' + d.lang : ''}\n\n${contacts ? '📬 *Contacts:*\n' + contacts + '\n\n' : ''}🔎 Find more vendors @premiumhoodiesbot`;
+      const esc = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+      const contacts = (d.contact || []).map(c => `${typeIcons[c.type]||'•'} ${esc(c.label)}: ${esc(c.val)}`).join('\n');
+      const text = `🏪 <b>${esc(d.name)}</b>\n📍 ${esc(d.loc)}\n🛍 ${esc(d.svc)}${d.lang ? ' · ' + esc(d.lang) : ''}\n\n${contacts ? '📬 <b>Contacts:</b>\n' + contacts + '\n\n' : ''}🔎 Find more vendors @premiumhoodiesbot`;
 
       const postFileId = readStr(vf.postFileId);
       const r = postFileId
-        ? await api('sendPhoto',   { chat_id: CHANNEL_ID, photo: postFileId, caption: text, parse_mode: 'Markdown' })
-        : await api('sendMessage', { chat_id: CHANNEL_ID, text, parse_mode: 'Markdown' });
+        ? await api('sendPhoto',   { chat_id: CHANNEL_ID, photo: postFileId, caption: text, parse_mode: 'HTML' })
+        : await api('sendMessage', { chat_id: CHANNEL_ID, text, parse_mode: 'HTML' });
 
       if (r.ok) {
         await fsPatch('post_queue', docId, { status: 'sent' });
