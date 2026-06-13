@@ -798,21 +798,17 @@ async function processPostQueue() {
       const contacts = (d.contact || []).map(c => `${typeIcons[c.type]||'•'} ${c.label}: ${c.val}`).join('\n');
       const text = `🏪 *${d.name}*\n📍 ${d.loc}\n🛍 ${d.svc}${d.lang ? ' · ' + d.lang : ''}\n\n${contacts ? '📬 *Contacts:*\n' + contacts + '\n\n' : ''}🔎 Find more vendors @premiumhoodiesbot`;
 
-      try {
-        const postFileId = readStr(vf.postFileId);
-        console.log(`📣 Posting ${d.name} — fileId: ${postFileId ? postFileId.slice(0,20)+'...' : 'NONE'} — channel: ${CHANNEL_ID}`);
-        if (postFileId) {
-          const r = await api('sendPhoto', { chat_id: CHANNEL_ID, photo: postFileId, caption: text, parse_mode: 'Markdown' });
-          console.log('sendPhoto result:', JSON.stringify(r).slice(0, 200));
-        } else {
-          const r = await api('sendMessage', { chat_id: CHANNEL_ID, text, parse_mode: 'Markdown' });
-          console.log('sendMessage result:', JSON.stringify(r).slice(0, 200));
-        }
+      const postFileId = readStr(vf.postFileId);
+      const r = postFileId
+        ? await api('sendPhoto',   { chat_id: CHANNEL_ID, photo: postFileId, caption: text, parse_mode: 'Markdown' })
+        : await api('sendMessage', { chat_id: CHANNEL_ID, text, parse_mode: 'Markdown' });
+
+      if (r.ok) {
         await fsPatch('post_queue', docId, { status: 'sent' });
         console.log(`✅ Posted vendor card: ${d.name}`);
-      } catch(e) {
-        console.error('Post to channel failed:', e.message);
-        await fsPatch('post_queue', docId, { status: 'failed', error: e.message });
+      } else {
+        await fsPatch('post_queue', docId, { status: 'failed', error: r.description || 'unknown' });
+        console.error(`❌ Channel post failed: ${r.description}`);
       }
     }
   } catch(e) {}
