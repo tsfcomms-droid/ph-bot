@@ -799,8 +799,9 @@ async function processPostQueue() {
       const text = `🏪 *${d.name}*\n📍 ${d.loc}\n🛍 ${d.svc}${d.lang ? ' · ' + d.lang : ''}\n\n${contacts ? '📬 *Contacts:*\n' + contacts + '\n\n' : ''}🔎 Find more vendors @premiumhoodiesbot`;
 
       try {
-        if (d.logoURL) {
-          await api('sendPhoto', { chat_id: CHANNEL_ID, photo: d.logoURL, caption: text, parse_mode: 'Markdown' });
+        const postFileId = readStr(vf.postFileId);
+        if (postFileId) {
+          await api('sendPhoto', { chat_id: CHANNEL_ID, photo: postFileId, caption: text, parse_mode: 'Markdown' });
         } else {
           await api('sendMessage', { chat_id: CHANNEL_ID, text, parse_mode: 'Markdown' });
         }
