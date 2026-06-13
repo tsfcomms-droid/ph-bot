@@ -800,18 +800,20 @@ async function processPostQueue() {
 
       try {
         const postFileId = readStr(vf.postFileId);
+        console.log(`📣 Posting ${d.name} — fileId: ${postFileId ? postFileId.slice(0,20)+'...' : 'NONE'} — channel: ${CHANNEL_ID}`);
         if (postFileId) {
-          await api('sendPhoto', { chat_id: CHANNEL_ID, photo: postFileId, caption: text, parse_mode: 'Markdown' });
+          const r = await api('sendPhoto', { chat_id: CHANNEL_ID, photo: postFileId, caption: text, parse_mode: 'Markdown' });
+          console.log('sendPhoto result:', JSON.stringify(r).slice(0, 200));
         } else {
-          await api('sendMessage', { chat_id: CHANNEL_ID, text, parse_mode: 'Markdown' });
+          const r = await api('sendMessage', { chat_id: CHANNEL_ID, text, parse_mode: 'Markdown' });
+          console.log('sendMessage result:', JSON.stringify(r).slice(0, 200));
         }
-        console.log(`📣 Posted vendor card: ${d.name}`);
+        await fsPatch('post_queue', docId, { status: 'sent' });
+        console.log(`✅ Posted vendor card: ${d.name}`);
       } catch(e) {
         console.error('Post to channel failed:', e.message);
+        await fsPatch('post_queue', docId, { status: 'failed', error: e.message });
       }
-
-      // Mark as sent
-      await fsPatch('post_queue', docId, { status: 'sent' });
     }
   } catch(e) {}
 }
