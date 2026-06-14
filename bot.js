@@ -794,10 +794,15 @@ async function processPostQueue() {
       });
       const d = { name: readStr(vf.name), loc: readStr(vf.loc), svc: readStr(vf.svc), lang: readStr(vf.lang), logoURL: readStr(vf.logoURL), contact: readArr(vf.contact) };
 
-      const typeIcons = { telegram:'📱', signal:'🔒', simplex:'💬', threema:'🛡', xmpp:'⚙️', link:'🔗', email:'📧' };
-      const esc = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-      const contacts = (d.contact || []).map(c => `${typeIcons[c.type]||'•'} ${esc(c.label)}: ${esc(c.val)}`).join('\n');
-      const text = `🏪 <b>${esc(d.name)}</b>\n📍 ${esc(d.loc)}\n🛍 ${esc(d.svc)}${d.lang ? ' · ' + esc(d.lang) : ''}\n\n${contacts ? '📬 <b>Contacts:</b>\n' + contacts + '\n\n' : ''}🔎 Find more vendors @premiumhoodiesbot`;
+      const typeIcons = { telegram:'📱', signal:'🔒', simplex:'💬', threema:'🛡', xmpp:'⚙️', link:'🔗', email:'📧', whatsapp:'💬', viber:'📞' };
+      const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+      const channels = (vf.channels?.arrayValue?.values || []).slice(0,3).map(v => esc(v.stringValue||''));
+      const contacts = (d.contact || []).slice(0,3).map(c => `${typeIcons[c.type]||'•'} ${esc(c.val)}`);
+      const parts = [];
+      if (channels.length) parts.push('📢 <b>Channels:</b>\n' + channels.join('\n\n'));
+      if (contacts.length) parts.push('📬 <b>Contacts:</b>\n' + contacts.join('\n\n'));
+      parts.push('🔎 Find more vendors @premiumhoodiesbot');
+      const text = parts.join('\n\n');
 
       const postFileId = readStr(vf.postFileId);
       const r = postFileId
@@ -851,7 +856,104 @@ async function poll() {
     console.error('Poll error:', e.message);
   }
   processPostQueue();
+  processPaymentRequests();
+  checkSubscriptionExpiry();
+  checkPostCooldownReminders();
   setTimeout(poll, 1000);
+}
+
+let lastExpiryCheck = 0;
+async function checkSubscriptionExpiry() {
+  const now = Date.now();
+  if (now - lastExpiryCheck < 60 * 60 * 1000) return; // check every hour
+  lastExpiryCheck = now;
+  try {
+    const res = await fsGet(`${FS_PATH}/vendors?key=${FB_KEY}`);
+    if (!res.documents) return;
+    for (const doc of res.documents) {
+      const f = doc.fields || {};
+      const tgUserId = f.tgUserId?.integerValue || f.tgUserId?.stringValue;
+      if (!tgUserId) continue;
+      const expiryRaw = f.subscriptionExpiry?.timestampValue;
+      if (!expiryRaw) continue;
+      const expiry = new Date(expiryRaw).getTime();
+      const daysLeft = Math.ceil((expiry - now) / 86400000);
+      if (daysLeft <= 0 || daysLeft > 7) continue;
+      const docId = doc.name.split('/').pop();
+      const vendorName = f.name?.stringValue || 'Your listing';
+      const expiryDate = new Date(expiryRaw).toLocaleDateString('en-GB', { day:'numeric', month:'short', year:'numeric' });
+      const sentD7 = f.warningSentD7?.booleanValue;
+      const sentD3 = f.warningSentD3?.booleanValue;
+      if (daysLeft <= 7 && daysLeft > 3 && !sentD7) {
+        await api('sendMessage', { chat_id: parseInt(tgUserId), parse_mode: 'HTML',
+          text: `⏰ <b>Subscription Expiring in ${daysLeft} Days</b>\n\n🏪 ${vendorName} expires on <b>${expiryDate}</b>.\n\nRenew now to stay listed 👇\nOpen @premiumhoodiesbot → Listed tab` });
+        await fsPatch('vendors', docId, { warningSentD7: true });
+        console.log(`⏰ 7-day warning sent to ${vendorName}`);
+      } else if (daysLeft <= 3 && !sentD3) {
+        await api('sendMessage', { chat_id: parseInt(tgUserId), parse_mode: 'HTML',
+          text: `🚨 <b>Subscription Expiring in ${daysLeft} Day${daysLeft!==1?'s':''}!</b>\n\n🏪 ${vendorName} expires on <b>${expiryDate}</b>. Act now to avoid being removed 👇\nOpen @premiumhoodiesbot → Listed tab` });
+        await fsPatch('vendors', docId, { warningSentD3: true });
+        console.log(`🚨 3-day warning sent to ${vendorName}`);
+      }
+    }
+  } catch(e) { console.error('Expiry check error:', e.message); }
+}
+
+let lastCooldownCheck = 0;
+async function checkPostCooldownReminders() {
+  const now = Date.now();
+  if (now - lastCooldownCheck < 60 * 60 * 1000) return; // check every hour
+  lastCooldownCheck = now;
+  const COOLDOWN = 7 * 24 * 60 * 60 * 1000;
+  try {
+    const res = await fsGet(`${FS_PATH}/vendors?key=${FB_KEY}`);
+    if (!res.documents) return;
+    for (const doc of res.documents) {
+      const f = doc.fields || {};
+      const tgUserId = f.tgUserId?.integerValue || f.tgUserId?.stringValue;
+      if (!tgUserId) continue;
+      const lastPostedRaw = f.lastPostedAt?.timestampValue;
+      if (!lastPostedRaw) continue;
+      const lastPosted = new Date(lastPostedRaw).getTime();
+      if (now - lastPosted < COOLDOWN) continue; // still on cooldown
+      const reminderSentFor = f.postReminderSentFor?.timestampValue;
+      if (reminderSentFor && new Date(reminderSentFor).getTime() === lastPosted) continue; // already reminded for this cycle
+      const docId = doc.name.split('/').pop();
+      const vendorName = f.name?.stringValue || 'You';
+      await api('sendMessage', { chat_id: parseInt(tgUserId), parse_mode: 'HTML',
+        text: `📣 <b>You Can Post Again!</b>\n\n🏪 ${vendorName} — your 1-week cooldown is over.\nPost your vendor card to the Premium Hoodies channel now 👇\n\nOpen @premiumhoodiesbot → Listed tab` });
+      await fsPatch('vendors', docId, { postReminderSentFor: lastPostedRaw });
+      console.log(`📣 Post reminder sent to ${vendorName}`);
+    }
+  } catch(e) { console.error('Cooldown reminder error:', e.message); }
+}
+
+let lastPaymentCheck = 0;
+async function processPaymentRequests() {
+  const now = Date.now();
+  if (now - lastPaymentCheck < 30000) return; // check every 30s
+  lastPaymentCheck = now;
+  try {
+    const url = `${FS_PATH}/payment_requests?key=${FB_KEY}`;
+    const res = await fsGet(url);
+    if (!res.documents) return;
+    for (const doc of res.documents) {
+      const f = doc.fields || {};
+      if (f.status?.stringValue !== 'pending') continue;
+      if (f.notified?.booleanValue) continue;
+      const docId = doc.name.split('/').pop();
+      const vendorName = f.vendorName?.stringValue || 'Unknown';
+      const plan       = f.plan?.stringValue || '?';
+      const price      = f.price?.integerValue || f.price?.doubleValue || '?';
+      const crypto     = f.crypto?.stringValue || '?';
+      const cryptoLabels = { USDT_TRON:'USDT (TRX)', USDT_ETH:'USDT (ETH)', BTC:'Bitcoin', ETH:'Ethereum', SOL:'Solana' };
+      const cryptoLabel = cryptoLabels[crypto] || crypto;
+      const text = `💳 <b>New Payment Request</b>\n\n🏪 <b>${vendorName}</b>\n📦 Plan: ${plan}\n💶 Amount: €${price}\n💱 Via: ${cryptoLabel}\n\n<i>Activate in the admin panel once payment is confirmed.</i>`;
+      await api('sendMessage', { chat_id: ADMIN_ID, text, parse_mode: 'HTML' });
+      await fsPatch('payment_requests', docId, { notified: true });
+      console.log(`💳 Payment request notification sent: ${vendorName} – ${plan}`);
+    }
+  } catch(e) {}
 }
 
 // ── Start ─────────────────────────────────────────────────────────────────────
