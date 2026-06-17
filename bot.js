@@ -35,7 +35,7 @@ function fsVal(v) {
   return { stringValue: String(v) };
 }
 
-async function fsGet(col, doc) {
+async function fsGetDoc(col, doc) {
   return fsRequest('GET', `${col}/${doc}`, null);
 }
 
@@ -64,11 +64,11 @@ async function fsPatch(col, doc, fields) {
 async function recordReferral(handle, newChatId, name, username) {
   try {
     // Check if this user was already referred
-    const joinDoc = await fsGet('referral_joins', String(newChatId));
+    const joinDoc = await fsGetDoc('referral_joins', String(newChatId));
     if (joinDoc.fields) return null; // already counted
 
     // Get referrer info
-    const refDoc = await fsGet('referrers', handle);
+    const refDoc = await fsGetDoc('referrers', handle);
     if (!refDoc.fields) return null; // handle doesn't exist
 
     const referrerChatId = parseInt(refDoc.fields.chatId?.integerValue || 0);
@@ -699,7 +699,7 @@ async function handleMessage(msg) {
 
 async function sendReferralLink(chatId, handle) {
   try {
-    const refDoc = await fsGet('referrers', handle);
+    const refDoc = await fsGetDoc('referrers', handle);
     if (!refDoc.fields) {
       return api('sendMessage', { chat_id: chatId, text: '❌ Handle not found. Claim it first in the Earn tab.' });
     }
@@ -817,7 +817,7 @@ async function processPostQueue() {
         console.error(`❌ Channel post failed: ${r.description}`);
       }
     }
-  } catch(e) {}
+  } catch(e) { console.error('processPostQueue error:', e.message); }
 }
 
 async function fsGet(url) {
@@ -859,7 +859,45 @@ async function poll() {
   processPaymentRequests();
   checkSubscriptionExpiry();
   checkPostCooldownReminders();
+  checkBotNotifications();
   setTimeout(poll, 1000);
+}
+
+let lastNotifCheck = 0;
+async function checkBotNotifications() {
+  const now = Date.now();
+  if (now - lastNotifCheck < 15000) return; // check every 15s
+  lastNotifCheck = now;
+  try {
+    const url = `${FS_PATH}/bot_notifications?key=${FB_KEY}`;
+    const res = await fsGet(url);
+    if (!res.documents) return;
+    for (const doc of res.documents) {
+      const f = doc.fields || {};
+      if (f.processed?.booleanValue) continue;
+      const docId = doc.name.split('/').pop();
+      const type = f.type?.stringValue;
+      const tgUserId = f.tgUserId?.integerValue || f.tgUserId?.stringValue;
+      if (!tgUserId) { await fsPatch('bot_notifications', docId, { processed: true }); continue; }
+      if (type === 'new_application') {
+        const esc = s => String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        const vendorName   = esc(f.vendorName?.stringValue || 'Unknown');
+        const vendorLoc    = esc(f.vendorLoc?.stringValue || '—');
+        const vendorPlan   = esc(f.vendorPlan?.stringValue || '—');
+        const vendorCrypto = esc(f.vendorCrypto?.stringValue || '—');
+        const tgHandle     = f.tgUsername?.stringValue ? `@${esc(f.tgUsername.stringValue)}` : esc(f.tgUserId?.integerValue || f.tgUserId?.stringValue || 'Unknown');
+        const text = `🆕 <b>New Vendor Application</b>\n\n🏪 <b>${vendorName}</b>\n📍 ${vendorLoc}\n👤 ${tgHandle}\n\n📦 Plan: <b>${vendorPlan}</b>\n💳 Paying with: ${vendorCrypto}\n\n<i>Review in the admin panel and approve or reject.</i>`;
+        await api('sendMessage', { chat_id: ADMIN_ID, text, parse_mode: 'HTML' });
+        console.log(`📩 New application from ${vendorName} notified to admin`);
+      } else if (type === 'payment_link') {
+        const vendorName = f.vendorName?.stringValue || 'Vendor';
+        const text = `🎉 <b>Your application to Premium Hoodies has been accepted!</b>\n\nHi ${vendorName}, your listing is approved — you just need to activate it with a subscription.\n\n<b>To get started:</b>\n1. Open @premiumhoodiesbot\n2. Tap <b>Listed</b> in the menu\n3. Choose your plan and pay with crypto\n4. Tap "I've Sent Payment" — we'll activate you within 24h 🚀\n\n💳 <b>Plans:</b>\n• 1 Month — €250\n• 3 Months — €650 <i>(Save €100)</i>\n• 6 Months — €1,200 <i>(Save €300)</i>\n\nOnce activated you'll appear in the directory and can post to the channel. 🏪`;
+        await api('sendMessage', { chat_id: Number(tgUserId), text, parse_mode: 'HTML' });
+        console.log(`📩 Payment link sent to ${vendorName} (${tgUserId})`);
+      }
+      await fsPatch('bot_notifications', docId, { processed: true });
+    }
+  } catch(e) { console.error('checkBotNotifications error:', e.message); }
 }
 
 let lastExpiryCheck = 0;
@@ -874,9 +912,9 @@ async function checkSubscriptionExpiry() {
       const f = doc.fields || {};
       const tgUserId = f.tgUserId?.integerValue || f.tgUserId?.stringValue;
       if (!tgUserId) continue;
-      const expiryRaw = f.subscriptionExpiry?.timestampValue;
+      const expiryRaw = f.subscriptionExpiry?.timestampValue || f.subscriptionExpiry?.integerValue || f.subscriptionExpiry?.stringValue;
       if (!expiryRaw) continue;
-      const expiry = new Date(expiryRaw).getTime();
+      const expiry = typeof expiryRaw === 'number' ? expiryRaw : new Date(expiryRaw).getTime();
       const daysLeft = Math.ceil((expiry - now) / 86400000);
       if (daysLeft <= 0 || daysLeft > 7) continue;
       const docId = doc.name.split('/').pop();
@@ -953,7 +991,7 @@ async function processPaymentRequests() {
       await fsPatch('payment_requests', docId, { notified: true });
       console.log(`💳 Payment request notification sent: ${vendorName} – ${plan}`);
     }
-  } catch(e) {}
+  } catch(e) { console.error('processPaymentRequests error:', e.message); }
 }
 
 // ── Start ─────────────────────────────────────────────────────────────────────
