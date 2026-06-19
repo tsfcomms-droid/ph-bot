@@ -30,6 +30,7 @@ function fsRequest(method, path, body) {
 }
 
 function fsVal(v) {
+  if (typeof v === 'boolean') return { booleanValue: v };
   if (typeof v === 'number') return { integerValue: String(v) };
   if (typeof v === 'string') return { stringValue: v };
   return { stringValue: String(v) };
@@ -50,6 +51,25 @@ async function fsPatch(col, doc, fields) {
       path:     `${FS_PATH}/${col}/${doc}?${updateMask}&key=${FB_KEY}`,
       method:   'PATCH',
       headers:  { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) }
+    }, res => {
+      let d = '';
+      res.on('data', c => d += c);
+      res.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { reject(e); } });
+    });
+    req.on('error', reject);
+    req.write(data);
+    req.end();
+  });
+}
+
+async function fsQuery(structuredQuery) {
+  return new Promise((resolve, reject) => {
+    const data = JSON.stringify({ structuredQuery });
+    const req = https.request({
+      hostname: FS_BASE,
+      path: `${FS_PATH}:runQuery?key=${FB_KEY}`,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) }
     }, res => {
       let d = '';
       res.on('data', c => d += c);
@@ -863,19 +883,23 @@ async function poll() {
   setTimeout(poll, 1000);
 }
 
+const _sentNotifIds = new Set();
 let lastNotifCheck = 0;
 async function checkBotNotifications() {
   const now = Date.now();
-  if (now - lastNotifCheck < 15000) return; // check every 15s
+  if (now - lastNotifCheck < 15000) return;
   lastNotifCheck = now;
   try {
-    const url = `${FS_PATH}/bot_notifications?key=${FB_KEY}`;
-    const res = await fsGet(url);
-    if (!res.documents) return;
-    for (const doc of res.documents) {
+    const rows = await fsQuery({
+      from: [{ collectionId: 'bot_notifications' }],
+      where: { fieldFilter: { field: { fieldPath: 'processed' }, op: 'EQUAL', value: { booleanValue: false } } }
+    });
+    const docs = rows.filter(r => r.document).map(r => r.document);
+    for (const doc of docs) {
       const f = doc.fields || {};
-      if (f.processed?.booleanValue) continue;
       const docId = doc.name.split('/').pop();
+      if (_sentNotifIds.has(docId)) continue;
+      _sentNotifIds.add(docId);
       const type = f.type?.stringValue;
       const tgUserId = f.tgUserId?.integerValue || f.tgUserId?.stringValue;
       if (!tgUserId) { await fsPatch('bot_notifications', docId, { processed: true }); continue; }
@@ -887,13 +911,13 @@ async function checkBotNotifications() {
         const vendorCrypto = esc(f.vendorCrypto?.stringValue || '—');
         const tgHandle     = f.tgUsername?.stringValue ? `@${esc(f.tgUsername.stringValue)}` : esc(f.tgUserId?.integerValue || f.tgUserId?.stringValue || 'Unknown');
         const text = `🆕 <b>New Vendor Application</b>\n\n🏪 <b>${vendorName}</b>\n📍 ${vendorLoc}\n👤 ${tgHandle}\n\n📦 Plan: <b>${vendorPlan}</b>\n💳 Paying with: ${vendorCrypto}\n\n<i>Review in the admin panel and approve or reject.</i>`;
-        await api('sendMessage', { chat_id: ADMIN_ID, text, parse_mode: 'HTML' });
-        console.log(`📩 New application from ${vendorName} notified to admin`);
+        try { await api('sendMessage', { chat_id: ADMIN_ID, text, parse_mode: 'HTML' }); console.log(`📩 New application from ${vendorName} notified to admin`); }
+        catch(e) { console.error(`❌ Failed to notify admin of ${vendorName}:`, e.message); }
       } else if (type === 'payment_link') {
         const vendorName = f.vendorName?.stringValue || 'Vendor';
         const text = `🎉 <b>Your application to Premium Hoodies has been accepted!</b>\n\nHi ${vendorName}, your listing is approved — you just need to activate it with a subscription.\n\n<b>To get started:</b>\n1. Open @premiumhoodiesbot\n2. Tap <b>Listed</b> in the menu\n3. Choose your plan and pay with crypto\n4. Tap "I've Sent Payment" — we'll activate you within 24h 🚀\n\n💳 <b>Plans:</b>\n• 1 Month — €250\n• 3 Months — €650 <i>(Save €100)</i>\n• 6 Months — €1,200 <i>(Save €300)</i>\n\nOnce activated you'll appear in the directory and can post to the channel. 🏪`;
-        await api('sendMessage', { chat_id: Number(tgUserId), text, parse_mode: 'HTML' });
-        console.log(`📩 Payment link sent to ${vendorName} (${tgUserId})`);
+        try { await api('sendMessage', { chat_id: Number(tgUserId), text, parse_mode: 'HTML' }); console.log(`📩 Payment link sent to ${vendorName} (${tgUserId})`); }
+        catch(e) { console.error(`❌ Failed to send acceptance to ${vendorName}:`, e.message); }
       }
       await fsPatch('bot_notifications', docId, { processed: true });
     }
@@ -967,19 +991,30 @@ async function checkPostCooldownReminders() {
 }
 
 let lastPaymentCheck = 0;
+const _sentPaymentReqIds = new Set();
 async function processPaymentRequests() {
   const now = Date.now();
   if (now - lastPaymentCheck < 30000) return; // check every 30s
   lastPaymentCheck = now;
   try {
-    const url = `${FS_PATH}/payment_requests?key=${FB_KEY}`;
-    const res = await fsGet(url);
-    if (!res.documents) return;
-    for (const doc of res.documents) {
+    const rows = await fsQuery({
+      from: [{ collectionId: 'payment_requests' }],
+      where: {
+        compositeFilter: {
+          op: 'AND',
+          filters: [
+            { fieldFilter: { field: { fieldPath: 'status' }, op: 'EQUAL', value: { stringValue: 'pending' } } },
+            { fieldFilter: { field: { fieldPath: 'notified' }, op: 'EQUAL', value: { booleanValue: false } } }
+          ]
+        }
+      }
+    });
+    const docs = rows.filter(r => r.document).map(r => r.document);
+    for (const doc of docs) {
       const f = doc.fields || {};
-      if (f.status?.stringValue !== 'pending') continue;
-      if (f.notified?.booleanValue) continue;
       const docId = doc.name.split('/').pop();
+      if (_sentPaymentReqIds.has(docId)) continue;
+      _sentPaymentReqIds.add(docId);
       const vendorName = f.vendorName?.stringValue || 'Unknown';
       const plan       = f.plan?.stringValue || '?';
       const price      = f.price?.integerValue || f.price?.doubleValue || '?';
@@ -987,9 +1022,9 @@ async function processPaymentRequests() {
       const cryptoLabels = { USDT_TRON:'USDT (TRX)', USDT_ETH:'USDT (ETH)', BTC:'Bitcoin', ETH:'Ethereum', SOL:'Solana' };
       const cryptoLabel = cryptoLabels[crypto] || crypto;
       const text = `💳 <b>New Payment Request</b>\n\n🏪 <b>${vendorName}</b>\n📦 Plan: ${plan}\n💶 Amount: €${price}\n💱 Via: ${cryptoLabel}\n\n<i>Activate in the admin panel once payment is confirmed.</i>`;
-      await api('sendMessage', { chat_id: ADMIN_ID, text, parse_mode: 'HTML' });
+      try { await api('sendMessage', { chat_id: ADMIN_ID, text, parse_mode: 'HTML' }); console.log(`💳 Payment request notification sent: ${vendorName} – ${plan}`); }
+      catch(e) { console.error(`❌ Failed to send payment request notification:`, e.message); }
       await fsPatch('payment_requests', docId, { notified: true });
-      console.log(`💳 Payment request notification sent: ${vendorName} – ${plan}`);
     }
   } catch(e) { console.error('processPaymentRequests error:', e.message); }
 }
