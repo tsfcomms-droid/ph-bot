@@ -33,6 +33,7 @@ function fsVal(v) {
   if (typeof v === 'boolean') return { booleanValue: v };
   if (typeof v === 'number') return { integerValue: String(v) };
   if (typeof v === 'string') return { stringValue: v };
+  if (v instanceof Date) return { timestampValue: v.toISOString() };
   return { stringValue: String(v) };
 }
 
@@ -454,6 +455,24 @@ async function handleCallback(cb) {
   const data   = cb.data;
 
   if (!chatId || !msgId) return;
+
+  // Membership verification — any user can press this
+  if (data.startsWith('verify:')) {
+    const userId = parseInt(data.slice(7));
+    if (userId !== chatId) return; // can't verify for someone else
+    try {
+      await fsPatch('channel_verifications', String(userId), { verified: true, verifiedAt: String(Date.now()) });
+    } catch(e) {}
+    try {
+      await api('editMessageText', { chat_id: chatId, message_id: msgId,
+        text: `✅ <b>You're verified!</b>\n\nWelcome to Premium Hoodies. Browse verified vendors here 👇`,
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🛍️ Browse Vendors', url: `https://t.me/premiumhoodiesbot` }]] }
+      });
+    } catch(e) {}
+    return;
+  }
+
   if (!isAdmin(chatId)) return;
 
   // Navigation
@@ -694,6 +713,17 @@ async function handleMessage(msg) {
     return showAdminMenu(chatId);
   }
 
+  // /start vref_DOCID — vendor referral tracking
+  if (text.startsWith('/start vref_')) {
+    const referrerDocId = text.slice('/start vref_'.length).trim();
+    if (referrerDocId) {
+      try { await fsPatch('vendor_referral_pending', String(chatId), { referrerDocId, pendingUserId: chatId, createdAt: String(Date.now()) }); } catch(e) {}
+      return api('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+        text: `👋 <b>Welcome!</b>\n\nYou were referred to Premium Hoodies.\n\nTap <b>Listed</b> in the menu to apply as a vendor — your referrer gets a bonus when you go live! 🎁`,
+        reply_markup: userKeyboard(cfg) });
+    }
+  }
+
   // /start getlink_HANDLE — generate unique channel invite link for referrer
   if (text.startsWith('/start getlink_')) {
     const handle = text.slice('/start getlink_'.length).trim();
@@ -769,16 +799,32 @@ async function handleChatMember(cm) {
   if (cm.chat?.id !== CHANNEL_ID) return;
   if (cm.new_chat_member?.status !== 'member') return;
 
+  const newUser  = cm.new_chat_member.user;
+  const newId    = newUser?.id;
+  const newName  = newUser?.first_name || 'there';
+  const newUname = newUser?.username   || '';
+
+  // Store pending verification
+  try {
+    await fsPatch('channel_verifications', String(newId), {
+      userId: newId, firstName: newName, username: newUname,
+      verified: false, createdAt: String(Date.now())
+    });
+  } catch(e) {}
+
+  // Send verification DM
+  try {
+    await api('sendMessage', { chat_id: newId, parse_mode: 'HTML',
+      text: `👋 <b>Hey ${newName}!</b>\n\nYou just joined <b>Premium Hoodies</b>.\n\nTap the button below to confirm you're a real member. If you don't confirm within 24 hours, you'll be removed from the channel.`,
+      reply_markup: { inline_keyboard: [[{ text: '✅ Confirm Membership', callback_data: `verify:${newId}` }]] }
+    });
+  } catch(e) {}
+
+  // Referral tracking
   const inviteLink = cm.invite_link;
   if (!inviteLink) return;
-
-  const handle = inviteLink.name; // we set name = handle when creating
+  const handle = inviteLink.name;
   if (!handle) return;
-
-  const newUser   = cm.new_chat_member.user;
-  const newId     = newUser?.id;
-  const newName   = newUser?.first_name || 'Someone';
-  const newUname  = newUser?.username   || '';
 
   const referrerChatId = await recordReferral(handle, newId, newName, newUname);
   if (referrerChatId && referrerChatId !== newId) {
@@ -880,7 +926,40 @@ async function poll() {
   checkSubscriptionExpiry();
   checkPostCooldownReminders();
   checkBotNotifications();
+  checkPendingVerifications();
   setTimeout(poll, 1000);
+}
+
+let lastVerifCheck = 0;
+async function checkPendingVerifications() {
+  const now = Date.now();
+  if (now - lastVerifCheck < 60000) return; // check every minute
+  lastVerifCheck = now;
+  try {
+    const rows = await fsQuery({
+      from: [{ collectionId: 'channel_verifications' }],
+      where: { fieldFilter: { field: { fieldPath: 'verified' }, op: 'EQUAL', value: { booleanValue: false } } }
+    });
+    for (const row of rows) {
+      if (!row.document) continue;
+      const f = row.document.fields || {};
+      const createdAt = parseInt(f.createdAt?.stringValue || '0');
+      if (now - createdAt < 24 * 60 * 60 * 1000) continue; // not expired yet
+      const userId = f.userId?.integerValue ? parseInt(f.userId.integerValue) : null;
+      if (!userId) continue;
+      const docId = row.document.name.split('/').pop();
+      try { await api('banChatMember', { chat_id: CHANNEL_ID, user_id: userId }); } catch(e) {}
+      try { await api('unbanChatMember', { chat_id: CHANNEL_ID, user_id: userId }); } catch(e) {} // unban so they can rejoin if they want
+      try {
+        const delUrl = `https://${FS_BASE}${FS_PATH}/channel_verifications/${docId}?key=${FB_KEY}`;
+        await new Promise((res, rej) => {
+          const req = https.request({ hostname: FS_BASE, path: `${FS_PATH}/channel_verifications/${docId}?key=${FB_KEY}`, method: 'DELETE' }, r => { r.on('data',()=>{}); r.on('end', res); });
+          req.on('error', rej); req.end();
+        });
+      } catch(e) {}
+      console.log(`🚫 Kicked unverified user ${userId} from channel`);
+    }
+  } catch(e) { console.error('checkPendingVerifications error:', e.message); }
 }
 
 const _sentNotifIds = new Set();
@@ -899,6 +978,9 @@ async function checkBotNotifications() {
       const f = doc.fields || {};
       const docId = doc.name.split('/').pop();
       if (_sentNotifIds.has(docId)) continue;
+      // Respect sendAfter for scheduled messages
+      const sendAfterTs = f.sendAfter?.timestampValue;
+      if (sendAfterTs && new Date(sendAfterTs).getTime() > Date.now()) continue;
       _sentNotifIds.add(docId);
       const type = f.type?.stringValue;
       const tgUserId = f.tgUserId?.integerValue || f.tgUserId?.stringValue;
@@ -918,6 +1000,53 @@ async function checkBotNotifications() {
         const text = `🎉 <b>Your application to Premium Hoodies has been accepted!</b>\n\nHi ${vendorName}, your listing is approved — you just need to activate it with a subscription.\n\n<b>To get started:</b>\n1. Open @premiumhoodiesbot\n2. Tap <b>Listed</b> in the menu\n3. Choose your plan and pay with crypto\n4. Tap "I've Sent Payment" — we'll activate you within 24h 🚀\n\n💳 <b>Plans:</b>\n• 1 Month — €250\n• 3 Months — €650 <i>(Save €100)</i>\n• 6 Months — €1,200 <i>(Save €300)</i>\n\nOnce activated you'll appear in the directory and can post to the channel. 🏪`;
         try { await api('sendMessage', { chat_id: Number(tgUserId), text, parse_mode: 'HTML' }); console.log(`📩 Payment link sent to ${vendorName} (${tgUserId})`); }
         catch(e) { console.error(`❌ Failed to send acceptance to ${vendorName}:`, e.message); }
+      } else if (type === 'rejected') {
+        const vendorName = f.vendorName?.stringValue || 'there';
+        const text = `❌ <b>Application Not Approved</b>\n\nHi ${vendorName}, unfortunately your application to Premium Hoodies was not approved at this time.\n\nYou're welcome to <b>reapply</b> with updated details — open @premiumhoodiesbot and go to the <b>Listed</b> tab to submit a new application. 🔄`;
+        try { await api('sendMessage', { chat_id: Number(tgUserId), text, parse_mode: 'HTML' }); console.log(`📩 Rejection sent to ${vendorName} (${tgUserId})`); }
+        catch(e) { console.error(`❌ Failed to send rejection to ${vendorName}:`, e.message); }
+      } else if (type === 'application_received') {
+        const vendorName = f.vendorName?.stringValue || 'there';
+        const text = `✅ <b>Application Received!</b>\n\nHi ${vendorName}, we've got your application to join Premium Hoodies! 🎉\n\nOur team will review it within 24–48 hours and you'll get a message here once it's approved.\n\nBrowse the vendor directory in the channel while you wait. 🏪`;
+        try { await api('sendMessage', { chat_id: Number(tgUserId), text, parse_mode: 'HTML' }); console.log(`📩 App received sent to ${vendorName}`); }
+        catch(e) { console.error(`❌ Failed to send app received:`, e.message); }
+      } else if (type === 'welcome_day2') {
+        const vendorName = f.vendorName?.stringValue || 'there';
+        const text = `📣 <b>Time to Post to the Channel!</b>\n\nHi ${vendorName}! You've been live for 24 hours — now let people know you're here.\n\n<b>How to post:</b>\n1. Open @premiumhoodiesbot\n2. Tap <b>Listed</b>\n3. Scroll to <b>Post to Channel</b>\n4. Tap <b>Preview &amp; Post →</b>\n\nYour vendor card reaches everyone in the channel. You can post once every 7 days. 🚀`;
+        try { await api('sendMessage', { chat_id: Number(tgUserId), text, parse_mode: 'HTML' }); console.log(`📩 Day 2 welcome sent to ${vendorName}`); }
+        catch(e) { console.error(`❌ Failed to send day 2 welcome:`, e.message); }
+      } else if (type === 'welcome_day3') {
+        const vendorName = f.vendorName?.stringValue || 'there';
+        const text = `💡 <b>Pro Tip — Complete Your Listing</b>\n\nHi ${vendorName}! Make sure your listing is fully set up.\n\n<b>Open @premiumhoodiesbot → Listed → Edit:</b>\n• Add all your channel links\n• Add contact links (Telegram, WhatsApp, Signal...)\n• Your contacts show when people tap your card\n\nThe more info you add, the more customers you get. ✏️`;
+        try { await api('sendMessage', { chat_id: Number(tgUserId), text, parse_mode: 'HTML' }); console.log(`📩 Day 3 welcome sent to ${vendorName}`); }
+        catch(e) { console.error(`❌ Failed to send day 3 welcome:`, e.message); }
+      } else if (type === 'referral_reward') {
+        const referrerDocId = f.referrerDocId?.stringValue;
+        const referredName = f.referredVendorName?.stringValue || 'a vendor';
+        const bonusDays = parseInt(f.bonusDays?.integerValue || 14);
+        if (referrerDocId) {
+          try {
+            const refVendor = await fsGetDoc('vendors', referrerDocId);
+            if (refVendor.fields) {
+              const refTgId = refVendor.fields.tgUserId?.integerValue || refVendor.fields.tgUserId?.stringValue;
+              const expTs = refVendor.fields.subscriptionExpiry?.timestampValue;
+              const currentExp = expTs ? new Date(expTs).getTime() : Date.now();
+              const base = currentExp > Date.now() ? currentExp : Date.now();
+              await fsPatch('vendors', referrerDocId, { subscriptionExpiry: new Date(base + bonusDays * 86400000), warningSentD7: false, warningSentD3: false });
+              if (refTgId) {
+                await api('sendMessage', { chat_id: parseInt(refTgId), parse_mode: 'HTML',
+                  text: `🎁 <b>Referral Bonus!</b>\n\n${referredName} just went live as a Premium Hoodies vendor — thanks to your referral!\n\nWe've added <b>${bonusDays} days</b> to your subscription. 🙌` });
+              }
+            }
+          } catch(e) { console.error(`❌ Failed to process referral reward:`, e.message); }
+        }
+      } else if (type === 'subscription_activated') {
+        const vendorName = f.vendorName?.stringValue || 'there';
+        const months = f.months?.integerValue || f.months?.doubleValue || '?';
+        const expiryDate = f.expiryDate?.stringValue || '';
+        const text = `✅ <b>Your Subscription is Now Active!</b>\n\nHi ${vendorName}, your listing on Premium Hoodies is <b>live</b>! 🎉\n\n📦 Plan: <b>${months} month${months > 1 ? 's' : ''}</b>${expiryDate ? `\n📅 Active until: <b>${expiryDate}</b>` : ''}\n\nYou can now:\n• Appear in the vendor directory\n• Post to the channel every 7 days\n\nOpen @premiumhoodiesbot → <b>Listed</b> to manage your listing. 🏪`;
+        try { await api('sendMessage', { chat_id: Number(tgUserId), text, parse_mode: 'HTML' }); console.log(`📩 Activation confirmed to ${vendorName} (${tgUserId})`); }
+        catch(e) { console.error(`❌ Failed to send activation to ${vendorName}:`, e.message); }
       }
       await fsPatch('bot_notifications', docId, { processed: true });
     }
