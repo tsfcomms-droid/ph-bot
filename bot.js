@@ -815,7 +815,7 @@ async function handleChatMember(cm) {
   // Send verification DM
   try {
     await api('sendMessage', { chat_id: newId, parse_mode: 'HTML',
-      text: `👋 <b>Hey ${newName}!</b>\n\nYou just joined <b>Premium Hoodies</b>.\n\nTap the button below to confirm you're a real member. If you don't confirm within 24 hours, you'll be removed from the channel.`,
+      text: `👋 <b>Hey ${newName}!</b>\n\nYou just joined <b>Premium Hoodies</b>.\n\nTap the button below to confirm you're a real member. If you don't confirm within 4 hours, you'll be removed from the channel.`,
       reply_markup: { inline_keyboard: [[{ text: '✅ Confirm Membership', callback_data: `verify:${newId}` }]] }
     });
   } catch(e) {}
@@ -944,7 +944,7 @@ async function checkPendingVerifications() {
       if (!row.document) continue;
       const f = row.document.fields || {};
       const createdAt = parseInt(f.createdAt?.stringValue || '0');
-      if (now - createdAt < 24 * 60 * 60 * 1000) continue; // not expired yet
+      if (now - createdAt < 4 * 60 * 60 * 1000) continue; // not expired yet (4 hours)
       const userId = f.userId?.integerValue ? parseInt(f.userId.integerValue) : null;
       if (!userId) continue;
       const docId = row.document.name.split('/').pop();
