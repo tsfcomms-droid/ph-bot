@@ -1,9 +1,15 @@
-const https = require('https');
-const fs    = require('fs');
+const https  = require('https');
+const http   = require('http');
+const crypto = require('crypto');
+const fs     = require('fs');
 
 const TOKEN      = '8723109846:AAGgik2d-BW3pkFnIxArFG6rIYnN_XNWSYY';
 const ADMIN_ID   = 7031425680;
 const CHANNEL_ID = -1002289726091;
+
+const NP_API_KEY   = 'WAAS44Q-JM4M53W-GWWNRAM-WN2Z52W';
+const NP_IPN_SECRET = 'mlfbYRDxSdoRQIjpeONfo1AGtlv965/Z';
+const PUBLIC_URL   = 'https://ph-bot-production.up.railway.app';
 
 // ── Firestore REST (for referral tracking) ────────────────────────────────────
 const FB_KEY  = 'AIzaSyBPHV_-_y8cmITx_Ye3psmODNXt3z9p1yc';
@@ -762,8 +768,8 @@ async function sendReferralLink(chatId, handle) {
     if (refDoc.fields.inviteLink?.stringValue) {
       return api('sendMessage', {
         chat_id: chatId,
-        text: `🔗 *Your referral link:*\n\n${refDoc.fields.inviteLink.stringValue}\n\nShare this link\\. Every person who joins the channel counts as 1 referral\\.`,
-        parse_mode: 'MarkdownV2'
+        text: `🔗 <b>Your referral link:</b>\n\n${refDoc.fields.inviteLink.stringValue}\n\nShare this link. Every person who joins the channel counts as 1 referral.`,
+        parse_mode: 'HTML'
       });
     }
 
@@ -784,8 +790,8 @@ async function sendReferralLink(chatId, handle) {
 
     return api('sendMessage', {
       chat_id: chatId,
-      text: `🔗 *Your referral link:*\n\n${inviteLink}\n\nShare this link\\. Every person who joins the channel counts as 1 referral\\.`,
-      parse_mode: 'MarkdownV2'
+      text: `🔗 <b>Your referral link:</b>\n\n${inviteLink}\n\nShare this link. Every person who joins the channel counts as 1 referral.`,
+      parse_mode: 'HTML'
     });
   } catch(e) {
     console.error('sendReferralLink error:', e.message);
@@ -1042,7 +1048,7 @@ async function checkBotNotifications() {
         }
       } else if (type === 'subscription_activated') {
         const vendorName = f.vendorName?.stringValue || 'there';
-        const months = f.months?.integerValue || f.months?.doubleValue || '?';
+        const months = parseInt(f.months?.integerValue || f.months?.doubleValue || 0) || '?';
         const expiryDate = f.expiryDate?.stringValue || '';
         const text = `✅ <b>Your Subscription is Now Active!</b>\n\nHi ${vendorName}, your listing on Premium Hoodies is <b>live</b>! 🎉\n\n📦 Plan: <b>${months} month${months > 1 ? 's' : ''}</b>${expiryDate ? `\n📅 Active until: <b>${expiryDate}</b>` : ''}\n\nYou can now:\n• Appear in the vendor directory\n• Post to the channel every 7 days\n\nOpen @premiumhoodiesbot → <b>Listed</b> to manage your listing. 🏪`;
         try { await api('sendMessage', { chat_id: Number(tgUserId), text, parse_mode: 'HTML' }); console.log(`📩 Activation confirmed to ${vendorName} (${tgUserId})`); }
@@ -1185,5 +1191,159 @@ async function start() {
   console.log('✅ Ready');
   poll();
 }
+
+// ── NOWPayments ───────────────────────────────────────────────────────────────
+
+function npRequest(method, path, body) {
+  return new Promise((resolve, reject) => {
+    const data = body ? JSON.stringify(body) : null;
+    const req = https.request({
+      hostname: 'api.nowpayments.io',
+      path: `/v1${path}`,
+      method,
+      headers: {
+        'x-api-key': NP_API_KEY,
+        'Content-Type': 'application/json',
+        ...(data ? { 'Content-Length': Buffer.byteLength(data) } : {})
+      }
+    }, res => {
+      let d = '';
+      res.on('data', c => d += c);
+      res.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { reject(e); } });
+    });
+    req.on('error', reject);
+    if (data) req.write(data);
+    req.end();
+  });
+}
+
+async function createNPInvoice(vendorId, vendorName, months, priceUsd) {
+  return npRequest('POST', '/invoice', {
+    price_amount: priceUsd,
+    price_currency: 'usd',
+    order_id: `ph_${vendorId}_${months}mo_${Date.now()}`,
+    order_description: `Premium Hoodies — ${vendorName} — ${months} month${months > 1 ? 's' : ''}`,
+    ipn_callback_url: `${PUBLIC_URL}/nowpayments-webhook`,
+    success_url: 'https://t.me/premiumhoodiesbot',
+    cancel_url: 'https://t.me/premiumhoodiesbot',
+    is_fixed_rate: false,
+    is_fee_paid_by_user: false
+  });
+}
+
+async function handleNPWebhook(body, signature) {
+  // Verify signature
+  const hmac = crypto.createHmac('sha512', NP_IPN_SECRET)
+    .update(JSON.stringify(JSON.parse(JSON.stringify(body), (k, v) => v), Object.keys(body).sort()))
+    .digest('hex');
+  if (hmac !== signature) {
+    console.error('NP webhook: invalid signature');
+    return false;
+  }
+
+  const { payment_status, order_id } = body;
+  console.log(`NP webhook: ${order_id} → ${payment_status}`);
+
+  if (payment_status !== 'finished' && payment_status !== 'confirmed') return true;
+
+  // order_id format: ph_VENDORID_Xmo_TIMESTAMP
+  const match = order_id.match(/^ph_(.+)_(\d+)mo_\d+$/);
+  if (!match) return true;
+  const vendorId = match[1];
+  const months   = parseInt(match[2]);
+
+  try {
+    const vendorSnap = await fsGetDoc('vendors', vendorId);
+    const vendorData = vendorSnap.fields || {};
+    const vendorName = vendorData.name?.stringValue || vendorId;
+    const now = Date.now();
+    const existing = vendorData.subscriptionExpiry;
+    const rawExpiry = existing?.timestampValue ? new Date(existing.timestampValue).getTime() : null;
+    const base = rawExpiry && rawExpiry > now ? rawExpiry : now;
+    const newExpiry = base + months * 30 * 24 * 60 * 60 * 1000;
+
+    await fsPatch('vendors', vendorId, {
+      subscriptionExpiry: new Date(newExpiry),
+      warningSentD7: false,
+      warningSentD3: false,
+    });
+
+    const expiryDate = new Date(newExpiry).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+
+    // Notify vendor via bot
+    const tgUserId = parseInt(vendorData.tgUserId?.integerValue || vendorData.tgUserId?.stringValue || 0);
+    if (tgUserId) {
+      const now3 = Date.now();
+      try {
+        await fsPatch('bot_notifications', `np_${vendorId}_${now3}`, { type: 'subscription_activated', tgUserId, vendorName, months, expiryDate, processed: false, createdAt: String(now3) });
+        await fsPatch('bot_notifications', `np_d2_${vendorId}_${now3}`, { type: 'welcome_day2', tgUserId, vendorName, processed: false, sendAfter: String(now3 + 86400000), createdAt: String(now3) });
+        await fsPatch('bot_notifications', `np_d3_${vendorId}_${now3}`, { type: 'welcome_day3', tgUserId, vendorName, processed: false, sendAfter: String(now3 + 172800000), createdAt: String(now3) });
+        if (vendorData.referredBy?.stringValue) {
+          await fsPatch('bot_notifications', `np_ref_${vendorId}_${now3}`, { type: 'referral_reward', referrerDocId: vendorData.referredBy.stringValue, referredVendorName: vendorName, bonusDays: 14, processed: false, createdAt: String(now3) });
+        }
+      } catch(ne) { console.error('NP notify error:', ne.message); }
+    }
+
+    // Notify admin
+    try {
+      await api('sendMessage', { chat_id: ADMIN_ID, text: `💰 Payment confirmed!\n\n${vendorName} paid for ${months} month${months > 1 ? 's' : ''}.\nSubscription active until ${expiryDate}.` });
+    } catch(e) {}
+
+    console.log(`✅ Subscription activated: ${vendorName} (${vendorId}) +${months} months`);
+  } catch(e) {
+    console.error('NP webhook activation error:', e.message);
+  }
+  return true;
+}
+
+// ── HTTP Server (webhook + invoice creation) ──────────────────────────────────
+
+const httpServer = http.createServer((req, res) => {
+  const url = req.url.split('?')[0];
+
+  // CORS for mini app
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+
+  if (url === '/nowpayments-webhook' && req.method === 'POST') {
+    let body = '';
+    req.on('data', c => body += c);
+    req.on('end', async () => {
+      try {
+        const parsed = JSON.parse(body);
+        const sig = req.headers['x-nowpayments-sig'] || '';
+        await handleNPWebhook(parsed, sig);
+        res.writeHead(200); res.end('ok');
+      } catch(e) {
+        console.error('Webhook parse error:', e.message);
+        res.writeHead(400); res.end('error');
+      }
+    });
+    return;
+  }
+
+  if (url === '/create-invoice' && req.method === 'POST') {
+    let body = '';
+    req.on('data', c => body += c);
+    req.on('end', async () => {
+      try {
+        const { vendorId, vendorName, months, priceUsd } = JSON.parse(body);
+        if (!vendorId || !months || !priceUsd) { res.writeHead(400); res.end('missing fields'); return; }
+        const invoice = await createNPInvoice(vendorId, vendorName, months, priceUsd);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ invoiceUrl: invoice.invoice_url, id: invoice.id }));
+      } catch(e) {
+        console.error('Create invoice error:', e.message);
+        res.writeHead(500); res.end('error');
+      }
+    });
+    return;
+  }
+
+  res.writeHead(404); res.end('not found');
+});
+
+httpServer.listen(3000, () => console.log('🌐 HTTP server listening on port 3000'));
 
 start();
