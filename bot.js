@@ -876,10 +876,26 @@ async function processPostQueue() {
       parts.push('🔎 Find more vendors @premiumhoodiesbot');
       const text = parts.join('\n\n');
 
-      const postFileId = readStr(vf.postFileId);
-      const r = postFileId
-        ? await api('sendPhoto',   { chat_id: CHANNEL_ID, photo: postFileId, caption: text, parse_mode: 'HTML' })
+      // Always fetch fresh postFileId from vendor doc — stored value may be stale/truncated
+      let postFileId = readStr(vf.postFileId);
+      const vendorId = readStr(f.vendorId);
+      if (vendorId) {
+        try {
+          const vendorDoc = await fsGetDoc('vendors', vendorId);
+          const freshId = vendorDoc?.fields?.postFileId?.stringValue;
+          if (freshId) postFileId = freshId;
+        } catch(e) { /* use stored postFileId as fallback */ }
+      }
+
+      let r = postFileId
+        ? await api('sendPhoto', { chat_id: CHANNEL_ID, photo: postFileId, caption: text, parse_mode: 'HTML' })
         : await api('sendMessage', { chat_id: CHANNEL_ID, text, parse_mode: 'HTML' });
+
+      // If photo fails, fall back to text-only
+      if (!r.ok && postFileId) {
+        console.error(`❌ sendPhoto failed (${r.description}), retrying as text`);
+        r = await api('sendMessage', { chat_id: CHANNEL_ID, text, parse_mode: 'HTML' });
+      }
 
       if (r.ok) {
         await fsPatch('post_queue', docId, { status: 'sent' });
@@ -1295,6 +1311,46 @@ async function handleNPWebhook(body, signature) {
   }
   return true;
 }
+
+// ── Daily Channel Post (8 PM UTC) ────────────────────────────────────────────
+const DAILY_ADS = [
+  'https://d8j0ntlcm91z4.cloudfront.net/user_3DtfzDNQcdHAxCu2vu9Vs4uR21C/hf_20260625_114226_85e903c0-52df-4516-a687-c0684fff5ec8.png',
+  'https://d8j0ntlcm91z4.cloudfront.net/user_3DtfzDNQcdHAxCu2vu9Vs4uR21C/hf_20260624_164325_098bc028-46b8-4e9a-bf9e-f818756e2881.png',
+  'https://d8j0ntlcm91z4.cloudfront.net/user_3DtfzDNQcdHAxCu2vu9Vs4uR21C/hf_20260623_130514_ba436f42-a9b2-4918-9761-dd345a29602d.png',
+  'https://d8j0ntlcm91z4.cloudfront.net/user_3DtfzDNQcdHAxCu2vu9Vs4uR21C/hf_20260618_205024_6a0851da-f0af-4521-b690-f4bda8fc4aa1.png',
+  'https://d8j0ntlcm91z4.cloudfront.net/user_3DtfzDNQcdHAxCu2vu9Vs4uR21C/hf_20260618_205012_061866f8-2426-44a5-a2c7-9b37dc3998ad.png',
+  'https://d8j0ntlcm91z4.cloudfront.net/user_3DtfzDNQcdHAxCu2vu9Vs4uR21C/hf_20260618_205020_80d7ad11-1f41-4ab8-a7e2-676df3e01d99.png',
+];
+let dailyAdIndex = 0;
+
+async function sendDailyPost() {
+  const url = DAILY_ADS[dailyAdIndex % DAILY_ADS.length];
+  dailyAdIndex++;
+  const res = await api('sendPhoto', { chat_id: CHANNEL_ID, photo: url, caption: '<b>www.premiumhoodies.io</b>', parse_mode: 'HTML' });
+  if (res.ok) {
+    console.log('✅ Daily post sent:', url);
+  } else {
+    console.error('❌ Daily post failed, trying next ad');
+    const fallback = DAILY_ADS[dailyAdIndex % DAILY_ADS.length];
+    dailyAdIndex++;
+    await api('sendPhoto', { chat_id: CHANNEL_ID, photo: fallback, caption: '<b>www.premiumhoodies.io</b>', parse_mode: 'HTML' });
+  }
+}
+
+function scheduleDailyPost() {
+  const now = new Date();
+  const next = new Date(now);
+  next.setUTCHours(20, 0, 0, 0);
+  if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
+  const ms = next - now;
+  console.log(`📅 Daily post scheduled in ${Math.round(ms / 60000)} min (8 PM UTC)`);
+  setTimeout(() => {
+    sendDailyPost();
+    setInterval(sendDailyPost, 24 * 60 * 60 * 1000);
+  }, ms);
+}
+
+scheduleDailyPost();
 
 // ── HTTP Server (webhook + invoice creation) ──────────────────────────────────
 
