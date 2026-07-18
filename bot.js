@@ -3,13 +3,17 @@ const http   = require('http');
 const crypto = require('crypto');
 const fs     = require('fs');
 
-const TOKEN      = '8723109846:AAGgik2d-BW3pkFnIxArFG6rIYnN_XNWSYY';
-const ADMIN_ID   = 7031425680;
-const CHANNEL_ID = -1002289726091;
+// Secrets come from environment variables (Railway → service → Variables).
+// Fallbacks keep the bot running until the vars are set — REMOVE them after
+// rotating the token (@BotFather) and NOWPayments keys, since the old values
+// below are considered exposed.
+const TOKEN      = process.env.TOKEN      || '8723109846:AAGgik2d-BW3pkFnIxArFG6rIYnN_XNWSYY';
+const ADMIN_ID   = parseInt(process.env.ADMIN_ID || '7031425680');
+const CHANNEL_ID = parseInt(process.env.CHANNEL_ID || '-1002289726091');
 
-const NP_API_KEY   = 'WAAS44Q-JM4M53W-GWWNRAM-WN2Z52W';
-const NP_IPN_SECRET = 'mlfbYRDxSdoRQIjpeONfo1AGtlv965/Z';
-const PUBLIC_URL   = 'https://ph-bot-production.up.railway.app';
+const NP_API_KEY    = process.env.NP_API_KEY    || 'WAAS44Q-JM4M53W-GWWNRAM-WN2Z52W';
+const NP_IPN_SECRET = process.env.NP_IPN_SECRET || 'mlfbYRDxSdoRQIjpeONfo1AGtlv965/Z';
+const PUBLIC_URL    = process.env.PUBLIC_URL    || 'https://ph-bot-production.up.railway.app';
 
 // ── Firestore REST (for referral tracking) ────────────────────────────────────
 const FB_KEY  = 'AIzaSyBPHV_-_y8cmITx_Ye3psmODNXt3z9p1yc';
@@ -266,10 +270,16 @@ function api(method, data) {
 
 // ── Keyboards ─────────────────────────────────────────────────────────────────
 
+function earnAppUrl(cfg) {
+  const base = cfg.links.shopUrl || '';
+  return base + (base.includes('#') ? '' : '#earn');
+}
+
 function userKeyboard(cfg) {
   return {
     inline_keyboard: [
       [{ text: '🏪 Vendor Portal', web_app: { url: cfg.links.shopUrl } }],
+      [{ text: '💰 Earn $1 / Friend', web_app: { url: earnAppUrl(cfg) } }],
       [{ text: '🔒 Escrow Service', url: cfg.links.escrow }, { text: '💰 Get Paid', url: cfg.links.getPaid }],
       [{ text: '📋 Get Listed', url: cfg.links.getListed }, { text: '📩 Contact Us', url: cfg.links.contact }],
       [{ text: '🌐 Website', url: cfg.links.website }]
@@ -470,10 +480,14 @@ async function handleCallback(cb) {
       await fsPatch('channel_verifications', String(userId), { verified: true, verifiedAt: String(Date.now()) });
     } catch(e) {}
     try {
+      const vcfg = loadConfig();
       await api('editMessageText', { chat_id: chatId, message_id: msgId,
-        text: `✅ <b>You're verified!</b>\n\nWelcome to Premium Hoodies. Browse verified vendors here 👇`,
+        text: `✅ <b>You're verified!</b>\n\nWelcome to Premium Hoodies. Browse verified vendors here 👇\n\n💰 <b>Want to earn?</b> Get $1 for every friend who joins — tap <b>Earn $1 / Friend</b> to grab your link.`,
         parse_mode: 'HTML',
-        reply_markup: { inline_keyboard: [[{ text: '🛍️ Browse Vendors', url: `https://t.me/premiumhoodiesbot` }]] }
+        reply_markup: { inline_keyboard: [
+          [{ text: '🛍️ Browse Vendors', web_app: { url: vcfg.links.shopUrl } }],
+          [{ text: '💰 Earn $1 / Friend', web_app: { url: earnAppUrl(vcfg) } }]
+        ] }
       });
     } catch(e) {}
     return;
@@ -1260,13 +1274,25 @@ async function handleNPWebhook(body, signature) {
   const { payment_status, order_id } = body;
   console.log(`NP webhook: ${order_id} → ${payment_status}`);
 
-  if (payment_status !== 'finished' && payment_status !== 'confirmed') return true;
-
   // order_id format: ph_VENDORID_Xmo_TIMESTAMP
   const match = order_id.match(/^ph_(.+)_(\d+)mo_\d+$/);
+  const vendorId = match ? match[1] : null;
+  const months   = match ? parseInt(match[2]) : 0;
+
+  // Always alert the admin about incoming payments (any status) so nothing is missed.
+  try {
+    const payAmt  = body.actually_paid != null ? body.actually_paid : (body.pay_amount != null ? body.pay_amount : '?');
+    const payCur  = (body.pay_currency || '').toUpperCase();
+    const priceUsd = body.price_amount != null ? body.price_amount : '?';
+    const label = { finished:'✅ PAID (confirmed)', confirmed:'✅ PAID (confirmed)', confirming:'⏳ Confirming on-chain…', sending:'⏳ Sending…', waiting:'⏳ Waiting for payment…', partially_paid:'⚠️ UNDERPAID — needs manual review', failed:'❌ FAILED', expired:'❌ Expired/unpaid', refunded:'↩️ Refunded' }[payment_status] || `ℹ️ ${payment_status}`;
+    const willActivate = (payment_status === 'finished' || payment_status === 'confirmed');
+    const note = willActivate ? 'Activating now…' : (payment_status === 'partially_paid' ? 'They paid LESS than the invoice — NOT activated. Activate manually if you accept it.' : 'Not activated.');
+    await api('sendMessage', { chat_id: ADMIN_ID, parse_mode: 'HTML',
+      text: `💳 <b>NOWPayments Update</b>\n\n${label}\n\n🏪 Vendor: <b>${vendorId || 'unknown'}</b>\n📦 Plan: ${months || '?'} month(s) · €${priceUsd}\n💰 Paid: ${payAmt} ${payCur}\n🧾 Order: <code>${order_id}</code>\n\n<i>${note}</i>` });
+  } catch(e) { console.error('NP admin alert failed:', e.message); }
+
   if (!match) return true;
-  const vendorId = match[1];
-  const months   = parseInt(match[2]);
+  if (payment_status !== 'finished' && payment_status !== 'confirmed') return true;
 
   try {
     const vendorSnap = await fsGetDoc('vendors', vendorId);
