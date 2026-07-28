@@ -1143,6 +1143,8 @@ async function checkPostCooldownReminders() {
       if (!lastPostedRaw) continue;
       const lastPosted = new Date(lastPostedRaw).getTime();
       if (now - lastPosted < COOLDOWN) continue; // still on cooldown
+      const expiryRaw = f.subscriptionExpiry?.timestampValue;
+      if (!expiryRaw || new Date(expiryRaw).getTime() < now) continue; // skip expired vendors
       const reminderSentFor = f.postReminderSentFor?.timestampValue;
       if (reminderSentFor && new Date(reminderSentFor).getTime() === lastPosted) continue; // already reminded for this cycle
       const docId = doc.name.split('/').pop();
@@ -1420,6 +1422,46 @@ const httpServer = http.createServer((req, res) => {
         res.writeHead(500); res.end('error');
       }
     });
+    return;
+  }
+
+  if (url === '/verify-telegram' && req.method === 'GET') {
+    const qs = new URLSearchParams(req.url.includes('?') ? req.url.split('?')[1] : '');
+    const id = qs.get('id'), hash = qs.get('hash'), auth_date = qs.get('auth_date');
+    if (!id || !hash || !auth_date) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'Missing params' }));
+      return;
+    }
+    // Verify Telegram login hash (HMAC-SHA256 with SHA256 of bot token as key)
+    const secretKey = crypto.createHash('sha256').update(TOKEN).digest();
+    const checkStr = ['auth_date','first_name','id','last_name','photo_url','username']
+      .filter(k => qs.has(k))
+      .sort()
+      .map(k => `${k}=${qs.get(k)}`)
+      .join('\n');
+    const expected = crypto.createHmac('sha256', secretKey).update(checkStr).digest('hex');
+    if (expected !== hash) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'Invalid auth' }));
+      return;
+    }
+    if (Math.floor(Date.now() / 1000) - parseInt(auth_date) > 86400) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'Auth expired' }));
+      return;
+    }
+    api('getChatMember', { chat_id: CHANNEL_ID, user_id: parseInt(id) })
+      .then(data => {
+        const status = data.result && data.result.status;
+        const inChannel = ['member', 'administrator', 'creator'].includes(status);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, inChannel, tgId: parseInt(id), tgUsername: qs.get('username') || qs.get('first_name') || '' }));
+      })
+      .catch(e => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: e.message }));
+      });
     return;
   }
 
