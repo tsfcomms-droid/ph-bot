@@ -1479,6 +1479,9 @@ const httpServer = http.createServer((req, res) => {
           if (fsRes.documents) docs.push(...fsRes.documents);
           pageToken = fsRes.nextPageToken || null;
         } while (pageToken);
+        // Respond immediately, broadcast in background
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, total: docs.length, status: 'sending in background' }));
         let sent = 0, failed = 0;
         for (const doc of docs) {
           const f = doc.fields || {};
@@ -1490,8 +1493,7 @@ const httpServer = http.createServer((req, res) => {
           } catch(e) { failed++; }
           await new Promise(r => setTimeout(r, 35));
         }
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, sent, failed }));
+        console.log(`Broadcast done — sent: ${sent}, failed: ${failed}`);
       } catch(e) {
         res.writeHead(500); res.end(e.message);
       }
