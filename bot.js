@@ -1472,8 +1472,13 @@ const httpServer = http.createServer((req, res) => {
       try {
         const { secret, message } = JSON.parse(body);
         if (secret !== 'HRBroadcast2026') { res.writeHead(403); res.end('forbidden'); return; }
-        const fsRes = await fsGet(`${FS_PATH}/bot_users?key=${FB_KEY}&pageSize=300`);
-        const docs = fsRes.documents || [];
+        let docs = [], pageToken = null;
+        do {
+          const qs = `${FS_PATH}/bot_users?key=${FB_KEY}&pageSize=300${pageToken ? '&pageToken=' + encodeURIComponent(pageToken) : ''}`;
+          const fsRes = await fsGet(qs);
+          if (fsRes.documents) docs.push(...fsRes.documents);
+          pageToken = fsRes.nextPageToken || null;
+        } while (pageToken);
         let sent = 0, failed = 0;
         for (const doc of docs) {
           const f = doc.fields || {};
