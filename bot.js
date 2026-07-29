@@ -1465,6 +1465,23 @@ const httpServer = http.createServer((req, res) => {
     return;
   }
 
+  if (url === '/admin-channel' && req.method === 'POST') {
+    let body = '';
+    req.on('data', c => body += c);
+    req.on('end', async () => {
+      try {
+        const { secret, message } = JSON.parse(body);
+        if (secret !== 'HRBroadcast2026') { res.writeHead(403); res.end('forbidden'); return; }
+        await api('sendMessage', { chat_id: CHANNEL_ID, text: message, parse_mode: 'HTML', disable_web_page_preview: true });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+      } catch(e) {
+        res.writeHead(500); res.end(JSON.stringify({ ok: false, error: e.message }));
+      }
+    });
+    return;
+  }
+
   if (url === '/admin-broadcast' && req.method === 'POST') {
     let body = '';
     req.on('data', c => body += c);
