@@ -1486,15 +1486,14 @@ const httpServer = http.createServer((req, res) => {
         if (secret !== 'HRBroadcast2026') { res.writeHead(403); res.end('forbidden'); return; }
         const imgBuf = Buffer.from(imageBase64, 'base64');
         const boundary = '----TGBoundary' + Date.now();
-        const mime = mimeType || 'image/png';
+        const mime = mimeType || 'image/jpeg';
         const ext = mime.includes('jpeg') || mime.includes('jpg') ? 'jpg' : 'png';
-        const parts = [
-          `--${boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n${ADMIN_ID}`,
-          `--${boundary}\r\nContent-Disposition: form-data; name="photo"; filename="card.${ext}"\r\nContent-Type: ${mime}\r\n\r\n`
-        ];
-        const prefix = Buffer.from(parts.join('\r\n') + '\r\n');
-        const suffix = Buffer.from(`\r\n--${boundary}--\r\n`);
-        const multipart = Buffer.concat([prefix, imgBuf, suffix]);
+        const multipart = Buffer.concat([
+          Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n${ADMIN_ID}\r\n`),
+          Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="photo"; filename="card.${ext}"\r\nContent-Type: ${mime}\r\n\r\n`),
+          imgBuf,
+          Buffer.from(`\r\n--${boundary}--\r\n`)
+        ]);
         const tgRes = await new Promise((resolve, reject) => {
           const r = https.request({ hostname:'api.telegram.org', path:`/bot${TOKEN}/sendPhoto`, method:'POST',
             headers:{'Content-Type':`multipart/form-data; boundary=${boundary}`,'Content-Length':multipart.length}
