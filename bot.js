@@ -1477,6 +1477,42 @@ const httpServer = http.createServer((req, res) => {
     return;
   }
 
+  if (url === '/admin-setcard' && req.method === 'POST') {
+    let body = '';
+    req.on('data', c => body += c);
+    req.on('end', async () => {
+      try {
+        const { secret, docId, imageBase64, mimeType } = JSON.parse(body);
+        if (secret !== 'HRBroadcast2026') { res.writeHead(403); res.end('forbidden'); return; }
+        const imgBuf = Buffer.from(imageBase64, 'base64');
+        const boundary = '----TGBoundary' + Date.now();
+        const mime = mimeType || 'image/png';
+        const ext = mime.includes('jpeg') || mime.includes('jpg') ? 'jpg' : 'png';
+        const parts = [
+          `--${boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n${ADMIN_ID}`,
+          `--${boundary}\r\nContent-Disposition: form-data; name="photo"; filename="card.${ext}"\r\nContent-Type: ${mime}\r\n\r\n`
+        ];
+        const prefix = Buffer.from(parts.join('\r\n') + '\r\n');
+        const suffix = Buffer.from(`\r\n--${boundary}--\r\n`);
+        const multipart = Buffer.concat([prefix, imgBuf, suffix]);
+        const tgRes = await new Promise((resolve, reject) => {
+          const r = https.request({ hostname:'api.telegram.org', path:`/bot${TOKEN}/sendPhoto`, method:'POST',
+            headers:{'Content-Type':`multipart/form-data; boundary=${boundary}`,'Content-Length':multipart.length}
+          }, resp => { let d=''; resp.on('data',c=>d+=c); resp.on('end',()=>resolve(JSON.parse(d))); });
+          r.on('error', reject); r.write(multipart); r.end();
+        });
+        if (!tgRes.ok) throw new Error(tgRes.description || 'Telegram upload failed');
+        const fileId = tgRes.result.photo[tgRes.result.photo.length - 1].file_id;
+        await fsPatch('vendors', docId, { postFileId: fileId });
+        res.writeHead(200, {'Content-Type':'application/json'});
+        res.end(JSON.stringify({ ok: true, fileId }));
+      } catch(e) {
+        res.writeHead(500); res.end(JSON.stringify({ ok: false, error: e.message }));
+      }
+    });
+    return;
+  }
+
   if (url === '/admin-channel' && req.method === 'POST') {
     let body = '';
     req.on('data', c => body += c);
