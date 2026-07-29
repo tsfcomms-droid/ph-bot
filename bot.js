@@ -718,6 +718,18 @@ async function handleMessage(msg) {
   trackUser(chatId, name, uname);
   logReport('message');
 
+  // Admin: send photo with caption /setcard [docId] to save postFileId
+  if (admin && msg.photo && msg.caption && msg.caption.startsWith('/setcard ')) {
+    const docId = msg.caption.slice('/setcard '.length).trim();
+    const fileId = msg.photo[msg.photo.length - 1].file_id;
+    try {
+      await fsPatch('vendors', docId, { postFileId: fileId });
+      return api('sendMessage', { chat_id: chatId, text: `✅ Card saved for <code>${docId}</code>`, parse_mode: 'HTML' });
+    } catch(e) {
+      return api('sendMessage', { chat_id: chatId, text: `❌ Failed: ${e.message}` });
+    }
+  }
+
   // Pending admin input
   if (admin && pending.has(chatId)) {
     return handlePending(chatId, text, pending.get(chatId));
