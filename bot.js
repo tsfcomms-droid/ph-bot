@@ -1465,6 +1465,35 @@ const httpServer = http.createServer((req, res) => {
     return;
   }
 
+  if (url === '/admin-broadcast' && req.method === 'POST') {
+    let body = '';
+    req.on('data', c => body += c);
+    req.on('end', async () => {
+      try {
+        const { secret, message } = JSON.parse(body);
+        if (secret !== 'HRBroadcast2026') { res.writeHead(403); res.end('forbidden'); return; }
+        const fsRes = await fsGet(`${FS_PATH}/bot_users?key=${FB_KEY}&pageSize=300`);
+        const docs = fsRes.documents || [];
+        let sent = 0, failed = 0;
+        for (const doc of docs) {
+          const f = doc.fields || {};
+          const chatId = f.chatId?.integerValue || f.chatId?.stringValue;
+          if (!chatId) continue;
+          try {
+            await api('sendMessage', { chat_id: parseInt(chatId), text: message, parse_mode: 'HTML', disable_web_page_preview: true });
+            sent++;
+          } catch(e) { failed++; }
+          await new Promise(r => setTimeout(r, 35));
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, sent, failed }));
+      } catch(e) {
+        res.writeHead(500); res.end(e.message);
+      }
+    });
+    return;
+  }
+
   res.writeHead(404); res.end('not found');
 });
 
