@@ -1512,6 +1512,41 @@ const httpServer = http.createServer((req, res) => {
     return;
   }
 
+  if (url === '/admin-post-vendor' && req.method === 'POST') {
+    let body = '';
+    req.on('data', c => body += c);
+    req.on('end', async () => {
+      try {
+        const { secret, docId } = JSON.parse(body);
+        if (secret !== 'HRBroadcast2026') { res.writeHead(403); res.end('forbidden'); return; }
+        const vendorDoc = await fsGetDoc('vendors', docId);
+        if (!vendorDoc) { res.writeHead(404); res.end('vendor not found'); return; }
+        const f = vendorDoc.fields || {};
+        const readStr = x => x?.stringValue || '';
+        const readArr = x => (x?.arrayValue?.values || []).map(v => { const mf=v.mapValue?.fields||{}; return { type:readStr(mf.type), val:readStr(mf.val) }; });
+        const typeIcons = { telegram:'📱', signal:'🔒', simplex:'💬', threema:'🛡', xmpp:'⚙️', link:'🔗', email:'📧', whatsapp:'💬', viber:'📞' };
+        const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        const channels = (f.channels?.arrayValue?.values||[]).slice(0,3).map(v=>esc(v.stringValue||''));
+        const contacts = readArr(f.contact).slice(0,3).map(c=>`${typeIcons[c.type]||'•'} ${esc(c.val)}`);
+        const parts = [];
+        if (channels.length) parts.push('📢 <b>Channels:</b>\n' + channels.join('\n\n'));
+        if (contacts.length) parts.push('📬 <b>Contacts:</b>\n' + contacts.join('\n\n'));
+        parts.push('🔎 Find more vendors @premiumhoodiesbot');
+        const text = parts.join('\n\n');
+        const postFileId = readStr(f.postFileId);
+        let r = postFileId
+          ? await api('sendPhoto', { chat_id: CHANNEL_ID, photo: postFileId, caption: text, parse_mode: 'HTML' })
+          : await api('sendMessage', { chat_id: CHANNEL_ID, text, parse_mode: 'HTML' });
+        if (!r.ok && postFileId) r = await api('sendMessage', { chat_id: CHANNEL_ID, text, parse_mode: 'HTML' });
+        res.writeHead(200, {'Content-Type':'application/json'});
+        res.end(JSON.stringify({ ok: r.ok, description: r.description }));
+      } catch(e) {
+        res.writeHead(500); res.end(JSON.stringify({ ok: false, error: e.message }));
+      }
+    });
+    return;
+  }
+
   if (url === '/admin-channel' && req.method === 'POST') {
     let body = '';
     req.on('data', c => body += c);
