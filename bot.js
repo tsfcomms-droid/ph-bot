@@ -1564,6 +1564,21 @@ const httpServer = http.createServer((req, res) => {
     return;
   }
 
+  if (url === '/admin-dm' && req.method === 'POST') {
+    let body = '';
+    req.on('data', c => body += c);
+    req.on('end', async () => {
+      try {
+        const { secret, chat_id, message } = JSON.parse(body);
+        if (secret !== 'HRBroadcast2026') { res.writeHead(403); res.end('forbidden'); return; }
+        const r = await api('sendMessage', { chat_id: parseInt(chat_id), text: message, parse_mode: 'HTML' });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: r.ok }));
+      } catch(e) { res.writeHead(500); res.end(e.message); }
+    });
+    return;
+  }
+
   if (url === '/admin-broadcast' && req.method === 'POST') {
     let body = '';
     req.on('data', c => body += c);
