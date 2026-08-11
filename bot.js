@@ -869,70 +869,118 @@ async function handleChatMember(cm) {
 
 // ── Post Queue ────────────────────────────────────────────────────────────────
 
-let lastQueueCheck = 0;
+const POST_DAYS = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
 
-async function processPostQueue() {
-  const now = Date.now();
-  if (now - lastQueueCheck < 15000) return; // check every 15s
-  lastQueueCheck = now;
+async function getAutoPostDay() {
   try {
-    const url = `${FS_PATH}/post_queue?key=${FB_KEY}`;
-    const res = await fsGet(url);
-    if (!res.documents) return;
-    for (const doc of res.documents) {
-      const f = doc.fields || {};
-      if (f.status?.stringValue !== 'pending') continue;
-      const docId = doc.name.split('/').pop();
-      // vendorData stored as a Firestore map — extract fields
-      const vf = f.vendorData?.mapValue?.fields || {};
-      const readStr = x => x?.stringValue || '';
-      const readArr = x => (x?.arrayValue?.values || []).map(v => {
-        const mf = v.mapValue?.fields || {};
-        return { type: readStr(mf.type), label: readStr(mf.label), val: readStr(mf.val) };
+    const res = await fsGet(`${FS_PATH}/vendors?key=${FB_KEY}`);
+    const counts = {};
+    POST_DAYS.forEach(d => counts[d] = 0);
+    if (res.documents) {
+      res.documents.forEach(doc => {
+        const day = doc.fields?.postDay?.stringValue;
+        if (day && counts[day] !== undefined) counts[day]++;
       });
-      const d = { name: readStr(vf.name), loc: readStr(vf.loc), svc: readStr(vf.svc), lang: readStr(vf.lang), logoURL: readStr(vf.logoURL), contact: readArr(vf.contact) };
-
-      const typeIcons = { telegram:'📱', signal:'🔒', simplex:'💬', threema:'🛡', xmpp:'⚙️', link:'🔗', email:'📧', whatsapp:'💬', viber:'📞' };
-      const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-      const channels = (vf.channels?.arrayValue?.values || []).slice(0,3).map(v => esc(v.stringValue||''));
-      const contacts = (d.contact || []).slice(0,3).map(c => `${typeIcons[c.type]||'•'} ${esc(c.val)}`);
-      const parts = [];
-      if (channels.length) parts.push('📢 <b>Channels:</b>\n' + channels.join('\n\n'));
-      if (contacts.length) parts.push('📬 <b>Contacts:</b>\n' + contacts.join('\n\n'));
-      parts.push('🔎 Find more vendors @premiumhoodiesbot');
-      const text = parts.join('\n\n');
-
-      // Always fetch fresh postFileId from vendor doc — stored value may be stale/truncated
-      let postFileId = readStr(vf.postFileId);
-      const vendorId = readStr(f.vendorId);
-      if (vendorId) {
-        try {
-          const vendorDoc = await fsGetDoc('vendors', vendorId);
-          const freshId = vendorDoc?.fields?.postFileId?.stringValue;
-          if (freshId) postFileId = freshId;
-        } catch(e) { /* use stored postFileId as fallback */ }
-      }
-
-      let r = postFileId
-        ? await api('sendPhoto', { chat_id: CHANNEL_ID, photo: postFileId, caption: text, parse_mode: 'HTML' })
-        : await api('sendMessage', { chat_id: CHANNEL_ID, text, parse_mode: 'HTML' });
-
-      // If photo fails, fall back to text-only
-      if (!r.ok && postFileId) {
-        console.error(`❌ sendPhoto failed (${r.description}), retrying as text`);
-        r = await api('sendMessage', { chat_id: CHANNEL_ID, text, parse_mode: 'HTML' });
-      }
-
-      if (r.ok) {
-        await fsPatch('post_queue', docId, { status: 'sent' });
-        console.log(`✅ Posted vendor card: ${d.name}`);
-      } else {
-        await fsPatch('post_queue', docId, { status: 'failed', error: r.description || 'unknown' });
-        console.error(`❌ Channel post failed: ${r.description}`);
-      }
     }
-  } catch(e) { console.error('processPostQueue error:', e.message); }
+    return POST_DAYS.slice().sort((a,b) => counts[a]-counts[b])[0];
+  } catch(e) { return 'Monday'; }
 }
+
+async function sendQueueItem(doc) {
+  const f = doc.fields || {};
+  const docId = doc.name.split('/').pop();
+  const vf = f.vendorData?.mapValue?.fields || {};
+  const readStr = x => x?.stringValue || '';
+  const readArr = x => (x?.arrayValue?.values || []).map(v => {
+    const mf = v.mapValue?.fields || {};
+    return { type: readStr(mf.type), label: readStr(mf.label), val: readStr(mf.val) };
+  });
+  const d = { name: readStr(vf.name), loc: readStr(vf.loc), svc: readStr(vf.svc), lang: readStr(vf.lang), contact: readArr(vf.contact) };
+  const typeIcons = { telegram:'📱', signal:'🔒', simplex:'💬', threema:'🛡', xmpp:'⚙️', link:'🔗', email:'📧', whatsapp:'💬', viber:'📞' };
+  const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  const channels = (vf.channels?.arrayValue?.values || []).slice(0,3).map(v => esc(v.stringValue||''));
+  const contacts = (d.contact || []).slice(0,3).map(c => `${typeIcons[c.type]||'•'} ${esc(c.val)}`);
+  const parts = [];
+  if (channels.length) parts.push('📢 <b>Channels:</b>\n' + channels.join('\n\n'));
+  if (contacts.length) parts.push('📬 <b>Contacts:</b>\n' + contacts.join('\n\n'));
+  parts.push('🔎 Find more vendors @premiumhoodiesbot');
+  const text = parts.join('\n\n');
+
+  let postFileId = readStr(vf.postFileId);
+  const vendorId = readStr(f.vendorId);
+  if (vendorId) {
+    try {
+      const vendorDoc = await fsGetDoc('vendors', vendorId);
+      const freshId = vendorDoc?.fields?.postFileId?.stringValue;
+      if (freshId) postFileId = freshId;
+    } catch(e) {}
+  }
+
+  let r = postFileId
+    ? await api('sendPhoto', { chat_id: CHANNEL_ID, photo: postFileId, caption: text, parse_mode: 'HTML' })
+    : await api('sendMessage', { chat_id: CHANNEL_ID, text, parse_mode: 'HTML' });
+  if (!r.ok && postFileId) r = await api('sendMessage', { chat_id: CHANNEL_ID, text, parse_mode: 'HTML' });
+
+  if (r.ok) {
+    await fsPatch('post_queue', docId, { status: 'sent' });
+    if (vendorId) {
+      try { await fsPatch('vendors', vendorId, { lastPostedAt: new Date().toISOString() }); } catch(e) {}
+    }
+    console.log(`✅ Posted vendor card: ${d.name}`);
+  } else {
+    await fsPatch('post_queue', docId, { status: 'failed', error: r.description || 'unknown' });
+    console.error(`❌ Channel post failed: ${r.description}`);
+  }
+}
+
+async function runDailyPostQueue() {
+  const today = POST_DAYS[new Date().getDay()];
+  console.log(`📬 Running daily post queue for ${today}`);
+  try {
+    const res = await fsGet(`${FS_PATH}/post_queue?key=${FB_KEY}`);
+    if (!res.documents) return;
+    const pending = res.documents.filter(doc => doc.fields?.status?.stringValue === 'pending');
+    if (!pending.length) { console.log('📭 No pending posts'); return; }
+
+    const withPriority = await Promise.all(pending.map(async doc => {
+      const vendorId = doc.fields?.vendorId?.stringValue;
+      let postDay = null;
+      if (vendorId) {
+        try { const vd = await fsGetDoc('vendors', vendorId); postDay = vd?.fields?.postDay?.stringValue; } catch(e) {}
+      }
+      const reqAt = doc.fields?.requestedAt?.timestampValue ? new Date(doc.fields.requestedAt.timestampValue).getTime() : 0;
+      return { doc, postDay, reqAt, isToday: postDay === today };
+    }));
+
+    withPriority.sort((a,b) => {
+      if (a.isToday && !b.isToday) return -1;
+      if (!a.isToday && b.isToday) return 1;
+      return a.reqAt - b.reqAt;
+    });
+
+    const TWO_HOURS = 2 * 60 * 60 * 1000;
+    withPriority.forEach((item, i) => {
+      setTimeout(() => sendQueueItem(item.doc), i * TWO_HOURS);
+    });
+
+    console.log(`📬 Scheduled ${withPriority.length} posts (${withPriority.filter(x=>x.isToday).length} priority today)`);
+  } catch(e) { console.error('runDailyPostQueue error:', e.message); }
+}
+
+function scheduleDailyPostRun() {
+  const now = new Date();
+  const noon = new Date(now);
+  noon.setHours(12, 0, 0, 0);
+  if (noon <= now) noon.setDate(noon.getDate() + 1);
+  const ms = noon - now;
+  console.log(`⏰ Next post queue run in ${Math.round(ms/60000)}min`);
+  setTimeout(() => {
+    runDailyPostQueue();
+    setInterval(runDailyPostQueue, 24 * 60 * 60 * 1000);
+  }, ms);
+}
+
+function processPostQueue() {} // no-op — replaced by scheduleDailyPostRun
 
 async function fsGet(url) {
   return new Promise((resolve, reject) => {
@@ -1352,8 +1400,8 @@ async function handleNPWebhook(body, signature) {
   return true;
 }
 
-// ── Daily Channel Post (8 PM UTC) ────────────────────────────────────────────
-const DAILY_ADS = [
+// ── Channel Post (Wednesday & Saturday, 8 PM UTC) ────────────────────────────
+const CHANNEL_ADS = [
   'https://d8j0ntlcm91z4.cloudfront.net/user_3DtfzDNQcdHAxCu2vu9Vs4uR21C/hf_20260625_114226_85e903c0-52df-4516-a687-c0684fff5ec8.png',
   'https://d8j0ntlcm91z4.cloudfront.net/user_3DtfzDNQcdHAxCu2vu9Vs4uR21C/hf_20260624_164325_098bc028-46b8-4e9a-bf9e-f818756e2881.png',
   'https://d8j0ntlcm91z4.cloudfront.net/user_3DtfzDNQcdHAxCu2vu9Vs4uR21C/hf_20260623_130514_ba436f42-a9b2-4918-9761-dd345a29602d.png',
@@ -1361,36 +1409,50 @@ const DAILY_ADS = [
   'https://d8j0ntlcm91z4.cloudfront.net/user_3DtfzDNQcdHAxCu2vu9Vs4uR21C/hf_20260618_205012_061866f8-2426-44a5-a2c7-9b37dc3998ad.png',
   'https://d8j0ntlcm91z4.cloudfront.net/user_3DtfzDNQcdHAxCu2vu9Vs4uR21C/hf_20260618_205020_80d7ad11-1f41-4ab8-a7e2-676df3e01d99.png',
 ];
-let dailyAdIndex = 0;
+let channelAdIndex = 0;
 
-async function sendDailyPost() {
-  const url = DAILY_ADS[dailyAdIndex % DAILY_ADS.length];
-  dailyAdIndex++;
+// Post days: 0 = Sunday, 4 = Thursday (UTC)
+const CHANNEL_POST_DAYS = [0, 4];
+
+async function sendChannelPost() {
+  const url = CHANNEL_ADS[channelAdIndex % CHANNEL_ADS.length];
+  channelAdIndex++;
   const res = await api('sendPhoto', { chat_id: CHANNEL_ID, photo: url, caption: '<b>www.premiumhoodies.io</b>', parse_mode: 'HTML' });
   if (res.ok) {
-    console.log('✅ Daily post sent:', url);
+    console.log('✅ Channel post sent:', url);
   } else {
-    console.error('❌ Daily post failed, trying next ad');
-    const fallback = DAILY_ADS[dailyAdIndex % DAILY_ADS.length];
-    dailyAdIndex++;
+    console.error('❌ Channel post failed, trying next ad');
+    const fallback = CHANNEL_ADS[channelAdIndex % CHANNEL_ADS.length];
+    channelAdIndex++;
     await api('sendPhoto', { chat_id: CHANNEL_ID, photo: fallback, caption: '<b>www.premiumhoodies.io</b>', parse_mode: 'HTML' });
   }
 }
 
-function scheduleDailyPost() {
+function scheduleNextChannelPost() {
   const now = new Date();
-  const next = new Date(now);
+  let next = new Date(now);
   next.setUTCHours(20, 0, 0, 0);
-  if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
+
+  // Find the next Wednesday or Saturday at 8 PM UTC
+  for (let i = 0; i <= 7; i++) {
+    const candidate = new Date(next);
+    candidate.setUTCDate(next.getUTCDate() + i);
+    if (CHANNEL_POST_DAYS.includes(candidate.getUTCDay()) && candidate > now) {
+      next = candidate;
+      break;
+    }
+  }
+
   const ms = next - now;
-  console.log(`📅 Daily post scheduled in ${Math.round(ms / 60000)} min (8 PM UTC)`);
-  setTimeout(() => {
-    sendDailyPost();
-    setInterval(sendDailyPost, 24 * 60 * 60 * 1000);
+  const days = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+  console.log(`📅 Channel post scheduled for ${days[next.getUTCDay()]} in ${Math.round(ms / 60000)} min (8 PM UTC)`);
+  setTimeout(async () => {
+    await sendChannelPost();
+    scheduleNextChannelPost();
   }, ms);
 }
 
-scheduleDailyPost();
+scheduleNextChannelPost();
 
 // ── HTTP Server (webhook + invoice creation) ──────────────────────────────────
 
@@ -1620,4 +1682,5 @@ const httpServer = http.createServer((req, res) => {
 
 httpServer.listen(3000, () => console.log('🌐 HTTP server listening on port 3000'));
 
+scheduleDailyPostRun();
 start();
