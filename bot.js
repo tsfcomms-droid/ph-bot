@@ -1020,7 +1020,7 @@ async function poll() {
   processPostQueue();
   processPaymentRequests();
   checkSubscriptionExpiry();
-  checkPostCooldownReminders();
+  checkPostScheduleReminders();
   checkBotNotifications();
   checkPendingVerifications();
   setTimeout(poll, 1000);
@@ -1187,11 +1187,19 @@ async function checkSubscriptionExpiry() {
 }
 
 let lastCooldownCheck = 0;
-async function checkPostCooldownReminders() {
+async function checkPostScheduleReminders() {
   const now = Date.now();
   if (now - lastCooldownCheck < 60 * 60 * 1000) return; // check every hour
   lastCooldownCheck = now;
   const COOLDOWN = 7 * 24 * 60 * 60 * 1000;
+
+  const todayUTC = new Date();
+  const todayStr = todayUTC.toISOString().slice(0, 10); // YYYY-MM-DD
+  const tomorrowUTC = new Date(now + 24 * 60 * 60 * 1000);
+  const tomorrowStr = tomorrowUTC.toISOString().slice(0, 10);
+  const todayName = POST_DAYS[todayUTC.getUTCDay()];
+  const tomorrowName = POST_DAYS[tomorrowUTC.getUTCDay()];
+
   try {
     const res = await fsGet(`${FS_PATH}/vendors?key=${FB_KEY}`);
     if (!res.documents) return;
@@ -1199,22 +1207,41 @@ async function checkPostCooldownReminders() {
       const f = doc.fields || {};
       const tgUserId = f.tgUserId?.integerValue || f.tgUserId?.stringValue;
       if (!tgUserId) continue;
-      const lastPostedRaw = f.lastPostedAt?.timestampValue;
-      if (!lastPostedRaw) continue;
-      const lastPosted = new Date(lastPostedRaw).getTime();
-      if (now - lastPosted < COOLDOWN) continue; // still on cooldown
+      const postDay = f.postDay?.stringValue;
+      if (!postDay) continue;
+      // Skip expired vendors
       const expiryRaw = f.subscriptionExpiry?.timestampValue;
-      if (!expiryRaw || new Date(expiryRaw).getTime() < now) continue; // skip expired vendors
-      const reminderSentFor = f.postReminderSentFor?.timestampValue;
-      if (reminderSentFor && new Date(reminderSentFor).getTime() === lastPosted) continue; // already reminded for this cycle
+      if (!expiryRaw || new Date(expiryRaw).getTime() < now) continue;
+      // Skip vendors still on cooldown
+      const lastPostedRaw = f.lastPostedAt?.timestampValue;
+      if (lastPostedRaw && now - new Date(lastPostedRaw).getTime() < COOLDOWN) continue;
+
       const docId = doc.name.split('/').pop();
       const vendorName = f.name?.stringValue || 'You';
-      await api('sendMessage', { chat_id: parseInt(tgUserId), parse_mode: 'HTML',
-        text: `📣 <b>You Can Post Again!</b>\n\n🏪 ${vendorName} — your 1-week cooldown is over.\nPost your vendor card to the Premium Hoodies channel now 👇\n\nOpen @premiumhoodiesbot → Listed tab` });
-      await fsPatch('vendors', docId, { postReminderSentFor: lastPostedRaw });
-      console.log(`📣 Post reminder sent to ${vendorName}`);
+
+      // Day-before reminder
+      if (postDay === tomorrowName) {
+        const lastSent = f.dayBeforeReminderSent?.stringValue;
+        if (lastSent !== todayStr) {
+          await api('sendMessage', { chat_id: parseInt(tgUserId), parse_mode: 'HTML',
+            text: `📅 <b>Tomorrow is your posting day!</b>\n\n🏪 ${vendorName} — tomorrow (<b>${tomorrowName}</b>) is your scheduled day to post your vendor card to the channel.\n\nGet ready! Open @premiumhoodiesbot → <b>Listed</b> tab and tap <b>Post to Channel</b> 🚀` });
+          await fsPatch('vendors', docId, { dayBeforeReminderSent: todayStr });
+          console.log(`📅 Day-before reminder sent to ${vendorName}`);
+        }
+      }
+
+      // Day-of reminder
+      if (postDay === todayName) {
+        const lastSent = f.dayOfReminderSent?.stringValue;
+        if (lastSent !== todayStr) {
+          await api('sendMessage', { chat_id: parseInt(tgUserId), parse_mode: 'HTML',
+            text: `📣 <b>Today is your day to post!</b>\n\n🏪 ${vendorName} — today (<b>${todayName}</b>) is your scheduled day to post your vendor card to the Premium Hoodies channel.\n\nOpen @premiumhoodiesbot → <b>Listed</b> tab and tap <b>Post to Channel</b> 🚀` });
+          await fsPatch('vendors', docId, { dayOfReminderSent: todayStr });
+          console.log(`📣 Day-of reminder sent to ${vendorName}`);
+        }
+      }
     }
-  } catch(e) { console.error('Cooldown reminder error:', e.message); }
+  } catch(e) { console.error('Post schedule reminder error:', e.message); }
 }
 
 let lastPaymentCheck = 0;
