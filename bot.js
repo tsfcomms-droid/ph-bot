@@ -889,6 +889,22 @@ async function getAutoPostDay() {
 async function sendQueueItem(doc) {
   const f = doc.fields || {};
   const docId = doc.name.split('/').pop();
+  const vendorId = f.vendorId?.stringValue || '';
+
+  // Guard: skip if vendor already posted in the last 24 hours (prevents double-post on bot restart)
+  if (vendorId) {
+    try {
+      const vendorDoc = await fsGetDoc('vendors', vendorId);
+      // lastPostedAt is stored as a stringValue ISO string
+      const lastPosted = vendorDoc?.fields?.lastPostedAt?.stringValue;
+      if (lastPosted && Date.now() - new Date(lastPosted).getTime() < 24 * 60 * 60 * 1000) {
+        await fsPatch('post_queue', docId, { status: 'skipped_duplicate' });
+        console.log(`⏭ Skipped duplicate post for vendor ${vendorId} (posted within 24h)`);
+        return;
+      }
+    } catch(e) {}
+  }
+
   const vf = f.vendorData?.mapValue?.fields || {};
   const readStr = x => x?.stringValue || '';
   const readArr = x => (x?.arrayValue?.values || []).map(v => {
@@ -907,7 +923,6 @@ async function sendQueueItem(doc) {
   const text = parts.join('\n\n');
 
   let postFileId = readStr(vf.postFileId);
-  const vendorId = readStr(f.vendorId);
   if (vendorId) {
     try {
       const vendorDoc = await fsGetDoc('vendors', vendorId);
@@ -935,6 +950,7 @@ async function sendQueueItem(doc) {
 
 async function runDailyPostQueue() {
   const today = POST_DAYS[new Date().getDay()];
+  const STALE_MS = 8 * 24 * 60 * 60 * 1000;
   console.log(`📬 Running daily post queue for ${today}`);
   try {
     const res = await fsGet(`${FS_PATH}/post_queue?key=${FB_KEY}`);
@@ -942,13 +958,29 @@ async function runDailyPostQueue() {
     const pending = res.documents.filter(doc => doc.fields?.status?.stringValue === 'pending');
     if (!pending.length) { console.log('📭 No pending posts'); return; }
 
-    const withPriority = await Promise.all(pending.map(async doc => {
+    // Expire items older than 8 days
+    const fresh = [];
+    for (const doc of pending) {
+      const reqStr = doc.fields?.requestedAt?.timestampValue || doc.fields?.requestedAt?.stringValue;
+      const age = reqStr ? Date.now() - new Date(reqStr).getTime() : 0;
+      if (age > STALE_MS) {
+        const id = doc.name.split('/').pop();
+        await fsPatch('post_queue', id, { status: 'expired' });
+        console.log(`🗑 Expired stale queue item: ${id}`);
+      } else {
+        fresh.push(doc);
+      }
+    }
+    if (!fresh.length) { console.log('📭 No fresh pending posts after expiry'); return; }
+
+    const withPriority = await Promise.all(fresh.map(async doc => {
       const vendorId = doc.fields?.vendorId?.stringValue;
       let postDay = null;
       if (vendorId) {
         try { const vd = await fsGetDoc('vendors', vendorId); postDay = vd?.fields?.postDay?.stringValue; } catch(e) {}
       }
-      const reqAt = doc.fields?.requestedAt?.timestampValue ? new Date(doc.fields.requestedAt.timestampValue).getTime() : 0;
+      const reqStr = doc.fields?.requestedAt?.timestampValue || doc.fields?.requestedAt?.stringValue;
+      const reqAt = reqStr ? new Date(reqStr).getTime() : 0;
       return { doc, postDay, reqAt, isToday: postDay === today };
     }));
 
@@ -967,7 +999,10 @@ async function runDailyPostQueue() {
   } catch(e) { console.error('runDailyPostQueue error:', e.message); }
 }
 
+let dailyRunScheduled = false;
 function scheduleDailyPostRun() {
+  if (dailyRunScheduled) return;
+  dailyRunScheduled = true;
   const now = new Date();
   const noon = new Date(now);
   noon.setHours(12, 0, 0, 0);
@@ -975,8 +1010,9 @@ function scheduleDailyPostRun() {
   const ms = noon - now;
   console.log(`⏰ Next post queue run in ${Math.round(ms/60000)}min`);
   setTimeout(() => {
+    dailyRunScheduled = false;
     runDailyPostQueue();
-    setInterval(runDailyPostQueue, 24 * 60 * 60 * 1000);
+    scheduleDailyPostRun();
   }, ms);
 }
 
