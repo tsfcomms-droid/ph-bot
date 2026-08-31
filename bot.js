@@ -51,6 +51,27 @@ async function fsGetDoc(col, doc) {
   return fsRequest('GET', `${col}/${doc}`, null);
 }
 
+async function fsCreate(col, fields) {
+  const firestoreFields = {};
+  for (const [k, v] of Object.entries(fields)) firestoreFields[k] = fsVal(v);
+  return new Promise((resolve, reject) => {
+    const data = JSON.stringify({ fields: firestoreFields });
+    const req = https.request({
+      hostname: FS_BASE,
+      path: `${FS_PATH}/${col}?key=${FB_KEY}`,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) }
+    }, res => {
+      let d = '';
+      res.on('data', c => d += c);
+      res.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { reject(e); } });
+    });
+    req.on('error', reject);
+    req.write(data);
+    req.end();
+  });
+}
+
 async function fsPatch(col, doc, fields) {
   const firestoreFields = {};
   for (const [k, v] of Object.entries(fields)) firestoreFields[k] = fsVal(v);
@@ -905,31 +926,36 @@ async function sendQueueItem(doc) {
     } catch(e) {}
   }
 
-  const vf = f.vendorData?.mapValue?.fields || {};
   const readStr = x => x?.stringValue || '';
   const readArr = x => (x?.arrayValue?.values || []).map(v => {
     const mf = v.mapValue?.fields || {};
     return { type: readStr(mf.type), label: readStr(mf.label), val: readStr(mf.val) };
   });
-  const d = { name: readStr(vf.name), loc: readStr(vf.loc), svc: readStr(vf.svc), lang: readStr(vf.lang), contact: readArr(vf.contact) };
   const typeIcons = { telegram:'📱', signal:'🔒', simplex:'💬', threema:'🛡', xmpp:'⚙️', link:'🔗', email:'📧', whatsapp:'💬', viber:'📞' };
   const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-  const channels = (vf.channels?.arrayValue?.values || []).slice(0,3).map(v => esc(v.stringValue||''));
+
+  // Always fetch fresh vendor data so channels/contacts/postFileId are up to date
+  let liveVf = f.vendorData?.mapValue?.fields || {};
+  let postFileId = readStr(liveVf.postFileId);
+  if (vendorId) {
+    try {
+      const vendorDoc = await fsGetDoc('vendors', vendorId);
+      if (vendorDoc?.fields) {
+        liveVf = vendorDoc.fields;
+        const freshId = vendorDoc.fields.postFileId?.stringValue;
+        if (freshId) postFileId = freshId;
+      }
+    } catch(e) {}
+  }
+
+  const d = { name: readStr(liveVf.name), contact: readArr(liveVf.contact) };
+  const channels = (liveVf.channels?.arrayValue?.values || []).slice(0,3).map(v => esc(v.stringValue||''));
   const contacts = (d.contact || []).slice(0,3).map(c => `${typeIcons[c.type]||'•'} ${esc(c.val)}`);
   const parts = [];
   if (channels.length) parts.push('📢 <b>Channels:</b>\n' + channels.join('\n\n'));
   if (contacts.length) parts.push('📬 <b>Contacts:</b>\n' + contacts.join('\n\n'));
   parts.push('🔎 Find more vendors @premiumhoodiesbot');
   const text = parts.join('\n\n');
-
-  let postFileId = readStr(vf.postFileId);
-  if (vendorId) {
-    try {
-      const vendorDoc = await fsGetDoc('vendors', vendorId);
-      const freshId = vendorDoc?.fields?.postFileId?.stringValue;
-      if (freshId) postFileId = freshId;
-    } catch(e) {}
-  }
 
   let r = postFileId
     ? await api('sendPhoto', { chat_id: CHANNEL_ID, photo: postFileId, caption: text, parse_mode: 'HTML' })
@@ -952,6 +978,51 @@ async function runDailyPostQueue() {
   const today = POST_DAYS[new Date().getDay()];
   const STALE_MS = 8 * 24 * 60 * 60 * 1000;
   console.log(`📬 Running daily post queue for ${today}`);
+
+  // Auto-queue vendors who have autoPost enabled and post day is today
+  try {
+    const autoRows = await fsQuery({
+      from: [{ collectionId: 'vendors' }],
+      where: {
+        compositeFilter: {
+          op: 'AND',
+          filters: [
+            { fieldFilter: { field: { fieldPath: 'autoPost' }, op: 'EQUAL', value: { booleanValue: true } } },
+            { fieldFilter: { field: { fieldPath: 'postDay' }, op: 'EQUAL', value: { stringValue: today } } },
+            { fieldFilter: { field: { fieldPath: 'active' }, op: 'EQUAL', value: { booleanValue: true } } },
+          ]
+        }
+      }
+    });
+    const autoVendors = (autoRows || []).filter(r => r.document);
+    for (const row of autoVendors) {
+      const vendorId = row.document.name.split('/').pop();
+      // Check for existing pending queue item for this vendor
+      const qRows = await fsQuery({
+        from: [{ collectionId: 'post_queue' }],
+        where: {
+          compositeFilter: {
+            op: 'AND',
+            filters: [
+              { fieldFilter: { field: { fieldPath: 'vendorId' }, op: 'EQUAL', value: { stringValue: vendorId } } },
+              { fieldFilter: { field: { fieldPath: 'status' }, op: 'EQUAL', value: { stringValue: 'pending' } } },
+            ]
+          }
+        }
+      });
+      const alreadyQueued = (qRows || []).some(r => r.document);
+      if (!alreadyQueued) {
+        await fsCreate('post_queue', {
+          vendorId,
+          status: 'pending',
+          autoQueued: true,
+          requestedAt: new Date().toISOString()
+        });
+        console.log(`🤖 Auto-queued vendor: ${vendorId}`);
+      }
+    }
+  } catch(e) { console.error('Auto-queue error:', e.message); }
+
   try {
     const res = await fsGet(`${FS_PATH}/post_queue?key=${FB_KEY}`);
     if (!res.documents) return;
