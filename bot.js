@@ -1817,4 +1817,5 @@ const httpServer = http.createServer((req, res) => {
 httpServer.listen(3000, () => console.log('🌐 HTTP server listening on port 3000'));
 
 scheduleDailyPostRun();
+runDailyPostQueue(); // process any pending posts immediately on startup
 start();
