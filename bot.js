@@ -1811,6 +1811,46 @@ const httpServer = http.createServer((req, res) => {
     return;
   }
 
+  if (url === '/admin/broadcast' && req.method === 'POST') {
+    let body = '';
+    req.on('data', c => body += c);
+    req.on('end', async () => {
+      try {
+        const { secret, text } = JSON.parse(body);
+        if (secret !== 'ph-broadcast-2026') { res.writeHead(403); res.end('forbidden'); return; }
+        if (!text) { res.writeHead(400); res.end('missing text'); return; }
+        res.writeHead(200); res.end('broadcast started');
+        // fetch all bot_users from Firestore and send
+        let pageToken = '';
+        const users = [];
+        do {
+          const fsUrl = `${FS_PATH}/bot_users?pageSize=500${pageToken ? '&pageToken=' + encodeURIComponent(pageToken) : ''}&key=${FB_KEY}`;
+          const fsRes = await new Promise((resolve, reject) => {
+            const r = https.request({ hostname: FS_BASE, path: fsUrl, method: 'GET' }, rr => {
+              let d = ''; rr.on('data', c => d += c); rr.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { reject(e); } });
+            }); r.on('error', reject); r.end();
+          });
+          if (fsRes.documents) {
+            for (const doc of fsRes.documents) {
+              const f = doc.fields || {};
+              const id = parseInt(f.chatId?.integerValue || 0);
+              if (id) users.push(id);
+            }
+          }
+          pageToken = fsRes.nextPageToken || '';
+        } while (pageToken);
+        console.log(`📢 Broadcast to ${users.length} users: ${text.substring(0,50)}`);
+        let ok = 0, fail = 0;
+        for (const chatId of users) {
+          try { await api('sendMessage', { chat_id: chatId, text }); ok++; } catch(e) { fail++; }
+          await new Promise(r => setTimeout(r, 50));
+        }
+        console.log(`📢 Broadcast done: ✅ ${ok} ❌ ${fail}`);
+      } catch(e) { console.error('Broadcast error:', e.message); }
+    });
+    return;
+  }
+
   res.writeHead(404); res.end('not found');
 });
 
