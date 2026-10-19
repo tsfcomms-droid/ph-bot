@@ -1185,6 +1185,7 @@ async function poll() {
   checkPostScheduleReminders();
   checkBotNotifications();
   checkPendingVerifications();
+  updateChannelMemberCount();
   setTimeout(poll, 1000);
 }
 
@@ -1404,6 +1405,20 @@ async function checkPostScheduleReminders() {
       }
     }
   } catch(e) { console.error('Post schedule reminder error:', e.message); }
+}
+
+let lastMemberCountCheck = 0;
+async function updateChannelMemberCount() {
+  const now = Date.now();
+  if (now - lastMemberCountCheck < 60 * 60 * 1000) return; // once per hour
+  lastMemberCountCheck = now;
+  try {
+    const res = await api('getChatMemberCount', { chat_id: CHANNEL_ID });
+    if (res.ok && res.result) {
+      await fsPatch('settings', 'channel_stats', { memberCount: res.result });
+      console.log(`📊 Channel member count: ${res.result}`);
+    }
+  } catch(e) { console.error('updateChannelMemberCount error:', e.message); }
 }
 
 let lastPaymentCheck = 0;
