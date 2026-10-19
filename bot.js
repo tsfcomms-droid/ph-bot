@@ -7,7 +7,7 @@ const fs     = require('fs');
 // Fallbacks keep the bot running until the vars are set — REMOVE them after
 // rotating the token (@BotFather) and NOWPayments keys, since the old values
 // below are considered exposed.
-const TOKEN      = process.env.TOKEN      || '8723109846:AAGgik2d-BW3pkFnIxArFG6rIYnN_XNWSYY';
+const TOKEN      = process.env.TOKEN;
 const ADMIN_ID   = parseInt(process.env.ADMIN_ID || '7031425680');
 const CHANNEL_ID = parseInt(process.env.CHANNEL_ID || '-1002289726091');
 
@@ -912,6 +912,18 @@ async function sendQueueItem(doc) {
   const docId = doc.name.split('/').pop();
   const vendorId = f.vendorId?.stringValue || '';
 
+  // Claim the item before doing anything — re-read status from Firestore to guard against
+  // two timers firing close together for the same item (race condition on bot restart)
+  try {
+    const fresh = await fsGetDoc('post_queue', docId);
+    const currentStatus = fresh?.fields?.status?.stringValue;
+    if (currentStatus !== 'pending') {
+      console.log(`⏭ Queue item ${docId} is already '${currentStatus}' — skipping`);
+      return;
+    }
+    await fsPatch('post_queue', docId, { status: 'processing' });
+  } catch(e) { console.error('Failed to claim queue item:', e.message); return; }
+
   // Guard: skip if vendor already posted in the last 24 hours (prevents double-post on bot restart)
   if (vendorId) {
     try {
@@ -974,7 +986,27 @@ async function sendQueueItem(doc) {
   }
 }
 
+async function hasQueueRunToday() {
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const doc = await fsGetDoc('settings', 'queue_run');
+    return doc.fields?.lastRunDate?.stringValue === today;
+  } catch(e) { return false; }
+}
+
+async function markQueueRanToday() {
+  try {
+    await fsPatch('settings', 'queue_run', { lastRunDate: new Date().toISOString().slice(0, 10) });
+  } catch(e) {}
+}
+
 async function runDailyPostQueue() {
+  if (await hasQueueRunToday()) {
+    console.log('📭 Post queue already ran today — skipping duplicate run');
+    return;
+  }
+  await markQueueRanToday();
+
   const today = POST_DAYS[new Date().getDay()];
   const STALE_MS = 8 * 24 * 60 * 60 * 1000;
   console.log(`📬 Running daily post queue for ${today}`);
@@ -1024,9 +1056,17 @@ async function runDailyPostQueue() {
   } catch(e) { console.error('Auto-queue error:', e.message); }
 
   try {
-    const res = await fsGet(`${FS_PATH}/post_queue?key=${FB_KEY}`);
-    if (!res.documents) return;
-    const pending = res.documents.filter(doc => doc.fields?.status?.stringValue === 'pending');
+    // Fetch all post_queue docs across pages (Firestore returns max 100/page by default)
+    const allDocs = [];
+    let pageToken = '';
+    do {
+      const url = `${FS_PATH}/post_queue?key=${FB_KEY}${pageToken ? '&pageToken=' + encodeURIComponent(pageToken) : ''}`;
+      const res = await fsGet(url);
+      if (res.documents) allDocs.push(...res.documents);
+      pageToken = res.nextPageToken || '';
+    } while (pageToken);
+    if (!allDocs.length) return;
+    const pending = allDocs.filter(doc => doc.fields?.status?.stringValue === 'pending');
     if (!pending.length) { console.log('📭 No pending posts'); return; }
 
     // Expire items older than 8 days
@@ -1061,12 +1101,27 @@ async function runDailyPostQueue() {
       return a.reqAt - b.reqAt;
     });
 
+    // Deduplicate: one post per vendor per run — skip extras
+    const seenVendors = new Set();
+    const deduped = [];
+    for (const item of withPriority) {
+      const vid = item.doc.fields?.vendorId?.stringValue;
+      if (vid && seenVendors.has(vid)) {
+        const dupId = item.doc.name.split('/').pop();
+        await fsPatch('post_queue', dupId, { status: 'skipped_duplicate' });
+        console.log(`⏭ Skipped duplicate queue item for vendor ${vid}`);
+        continue;
+      }
+      if (vid) seenVendors.add(vid);
+      deduped.push(item);
+    }
+
     const TWO_HOURS = 2 * 60 * 60 * 1000;
-    withPriority.forEach((item, i) => {
+    deduped.forEach((item, i) => {
       setTimeout(() => sendQueueItem(item.doc), i * TWO_HOURS);
     });
 
-    console.log(`📬 Scheduled ${withPriority.length} posts (${withPriority.filter(x=>x.isToday).length} priority today)`);
+    console.log(`📬 Scheduled ${deduped.length} posts (${deduped.filter(x=>x.isToday).length} priority today)`);
   } catch(e) { console.error('runDailyPostQueue error:', e.message); }
 }
 
@@ -1320,7 +1375,7 @@ async function checkPostScheduleReminders() {
       const expiryRaw = f.subscriptionExpiry?.timestampValue;
       if (!expiryRaw || new Date(expiryRaw).getTime() < now) continue;
       // Skip vendors still on cooldown
-      const lastPostedRaw = f.lastPostedAt?.timestampValue;
+      const lastPostedRaw = f.lastPostedAt?.stringValue || f.lastPostedAt?.timestampValue;
       if (lastPostedRaw && now - new Date(lastPostedRaw).getTime() < COOLDOWN) continue;
 
       const docId = doc.name.split('/').pop();
@@ -1811,42 +1866,37 @@ const httpServer = http.createServer((req, res) => {
     return;
   }
 
-  if (url === '/admin/broadcast' && req.method === 'POST') {
+  if (url === '/admin-photo-broadcast' && req.method === 'POST') {
     let body = '';
     req.on('data', c => body += c);
     req.on('end', async () => {
       try {
-        const { secret, text } = JSON.parse(body);
-        if (secret !== 'ph-broadcast-2026') { res.writeHead(403); res.end('forbidden'); return; }
-        if (!text) { res.writeHead(400); res.end('missing text'); return; }
-        res.writeHead(200); res.end('broadcast started');
-        // fetch all bot_users from Firestore and send
-        let pageToken = '';
-        const users = [];
+        const { secret, fileId, caption } = JSON.parse(body);
+        if (secret !== 'HRBroadcast2026') { res.writeHead(403); res.end('forbidden'); return; }
+        let docs = [], pageToken = null;
         do {
-          const fsUrl = `${FS_PATH}/bot_users?pageSize=500${pageToken ? '&pageToken=' + encodeURIComponent(pageToken) : ''}&key=${FB_KEY}`;
-          const fsRes = await new Promise((resolve, reject) => {
-            const r = https.request({ hostname: FS_BASE, path: fsUrl, method: 'GET' }, rr => {
-              let d = ''; rr.on('data', c => d += c); rr.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { reject(e); } });
-            }); r.on('error', reject); r.end();
-          });
-          if (fsRes.documents) {
-            for (const doc of fsRes.documents) {
-              const f = doc.fields || {};
-              const id = parseInt(f.chatId?.integerValue || 0);
-              if (id) users.push(id);
-            }
-          }
-          pageToken = fsRes.nextPageToken || '';
+          const qs = `${FS_PATH}/bot_users?key=${FB_KEY}&pageSize=300${pageToken ? '&pageToken=' + encodeURIComponent(pageToken) : ''}`;
+          const fsRes = await fsGet(qs);
+          if (fsRes.documents) docs.push(...fsRes.documents);
+          pageToken = fsRes.nextPageToken || null;
         } while (pageToken);
-        console.log(`📢 Broadcast to ${users.length} users: ${text.substring(0,50)}`);
-        let ok = 0, fail = 0;
-        for (const chatId of users) {
-          try { await api('sendMessage', { chat_id: chatId, text }); ok++; } catch(e) { fail++; }
-          await new Promise(r => setTimeout(r, 50));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, total: docs.length, status: 'sending in background' }));
+        let sent = 0, failed = 0;
+        for (const doc of docs) {
+          const f = doc.fields || {};
+          const chatId = f.chatId?.integerValue || f.chatId?.stringValue;
+          if (!chatId) continue;
+          try {
+            await api('sendPhoto', { chat_id: parseInt(chatId), photo: fileId, caption, parse_mode: 'HTML' });
+            sent++;
+          } catch(e) { failed++; }
+          await new Promise(r => setTimeout(r, 35));
         }
-        console.log(`📢 Broadcast done: ✅ ${ok} ❌ ${fail}`);
-      } catch(e) { console.error('Broadcast error:', e.message); }
+        console.log(`Photo broadcast done — sent: ${sent}, failed: ${failed}`);
+      } catch(e) {
+        res.writeHead(500); res.end(e.message);
+      }
     });
     return;
   }
