@@ -183,7 +183,14 @@ function saveJSON(file, data) {
 }
 function loadConfig() {
   const saved = loadJSON(CONFIG_FILE, {});
-  return { ...DEFAULTS, ...saved, links: { ...DEFAULTS.links, ...(saved.links || {}) } };
+  const merged = { ...DEFAULTS, ...saved, links: { ...DEFAULTS.links, ...(saved.links || {}) } };
+  // Auto-fix: reset welcome message if it contains a legacy channel-gate string
+  if (merged.welcomeMessage && (merged.welcomeMessage.includes('must join') || merged.welcomeMessage.includes('anonymouspump'))) {
+    merged.welcomeMessage = DEFAULTS.welcomeMessage;
+    saveJSON(CONFIG_FILE, merged);
+    console.log('⚠️ Legacy welcome message detected and reset to default.');
+  }
+  return merged;
 }
 function saveConfig(cfg) { saveJSON(CONFIG_FILE, cfg); }
 
