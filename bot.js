@@ -47,6 +47,30 @@ function fsVal(v) {
   return { stringValue: String(v) };
 }
 
+function validateInitData(initData) {
+  if (!initData) return false;
+  try {
+    const params = new URLSearchParams(initData);
+    const hash = params.get('hash');
+    if (!hash) return false;
+    params.delete('hash');
+    const dataCheckString = [...params.entries()]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([k, v]) => `${k}=${v}`)
+      .join('\n');
+    const secretKey = crypto.createHmac('sha256', 'WebAppData').update(TOKEN).digest();
+    const expectedHash = crypto.createHmac('sha256', secretKey).update(dataCheckString).digest('hex');
+    return hash === expectedHash;
+  } catch { return false; }
+}
+
+function getUserFromInitData(initData) {
+  try {
+    const params = new URLSearchParams(initData);
+    const user = params.get('user');
+    return user ? JSON.parse(user) : null;
+  } catch { return null; }
+}
 async function fsGetDoc(col, doc) {
   return fsRequest('GET', `${col}/${doc}`, null);
 }
@@ -1755,8 +1779,13 @@ const httpServer = http.createServer((req, res) => {
     req.on('data', c => body += c);
     req.on('end', async () => {
       try {
-        const { secret, docId, imageBase64, mimeType } = JSON.parse(body);
-        if (secret !== 'HRBroadcast2026') { res.writeHead(403); res.end('forbidden'); return; }
+        const { initData, docId, imageBase64, mimeType } = JSON.parse(body);
+        if (!validateInitData(initData)) { res.writeHead(403); res.end('forbidden'); return; }
+        const caller = getUserFromInitData(initData);
+        if (!caller?.id || !docId) { res.writeHead(400); res.end('bad request'); return; }
+        const vd = await fsGetDoc('vendors', docId);
+        const ownerTgId = vd?.fields?.tgUserId?.integerValue || vd?.fields?.tgUserId?.stringValue;
+        if (!ownerTgId || String(caller.id) !== String(ownerTgId)) { res.writeHead(403); res.end('forbidden'); return; }
         const imgBuf = Buffer.from(imageBase64, 'base64');
         const boundary = '----TGBoundary' + Date.now();
         const mime = mimeType || 'image/jpeg';
@@ -1790,10 +1819,14 @@ const httpServer = http.createServer((req, res) => {
     req.on('data', c => body += c);
     req.on('end', async () => {
       try {
-        const { secret, docId } = JSON.parse(body);
-        if (secret !== 'HRBroadcast2026') { res.writeHead(403); res.end('forbidden'); return; }
+        const { initData, docId } = JSON.parse(body);
+        if (!validateInitData(initData)) { res.writeHead(403); res.end('forbidden'); return; }
+        const caller = getUserFromInitData(initData);
+        if (!caller?.id || !docId) { res.writeHead(400); res.end('bad request'); return; }
         const vendorDoc = await fsGetDoc('vendors', docId);
-        if (!vendorDoc) { res.writeHead(404); res.end('vendor not found'); return; }
+        if (!vendorDoc?.fields) { res.writeHead(404); res.end('vendor not found'); return; }
+        const ownerTgId = vendorDoc.fields?.tgUserId?.integerValue || vendorDoc.fields?.tgUserId?.stringValue;
+        if (String(caller.id) !== String(ownerTgId)) { res.writeHead(403); res.end('forbidden'); return; }
         const f = vendorDoc.fields || {};
         const readStr = x => x?.stringValue || '';
         const readArr = x => (x?.arrayValue?.values || []).map(v => { const mf=v.mapValue?.fields||{}; return { type:readStr(mf.type), val:readStr(mf.val) }; });
